@@ -1,0 +1,33 @@
+---
+title: "compare_predict_actual"
+output: html_document
+---
+
+```{r}
+library(xgboost)
+library(prodlim)
+library(here)
+library(survival)
+library(pec)
+library(survminer)
+library(rms)
+library(ROCR)
+library(ggplot2)
+library(dplyr)
+library(patchwork)  # Optional, for layout
+library(viridis)
+library(scales)
+library(patchwork)
+
+set.seed(1)
+
+# get data from source
+setwd("C:/Users/loucu/Coding_Projects/breast-cancer-cpm-validation")
+source(here("preprocess.R"))
+```
+
+```{r}
+# get PREDICT 5 year OS probability for:
+
+```
+

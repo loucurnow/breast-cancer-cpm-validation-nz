@@ -1,0 +1,3 @@
+[submodule "predict-v30-r"]
+	path = predict-v30-r
+	url = https://github.com/WintonCentre/predict-v30-r

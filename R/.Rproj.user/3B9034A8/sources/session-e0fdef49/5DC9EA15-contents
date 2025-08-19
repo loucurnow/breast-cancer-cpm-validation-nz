@@ -1,0 +1,395 @@
+---
+title: "exploratory"
+output: html_document
+---
+
+```{r}
+library(xgboost)
+library(prodlim)
+library(here)
+library(survival)
+library(pec)
+library(survminer)
+library(rms)
+library(ROCR)
+library(ggplot2)
+library(dplyr)
+library(patchwork)  # Optional, for layout
+library(viridis)
+library(scales)
+library(patchwork)
+
+set.seed(1)
+
+# get data from source
+setwd("C:/Users/loucu/Coding_Projects/breast-cancer-cpm-validation")
+source(here("preprocess.R"))
+```
+```{r}
+# adding labels and making variables factor for plotting
+labels.erpr <- c("ER-, PR-", 
+                 "ER-, PR+", 
+                 "ER+, PR-", 
+                 "ER+, PR+")
+
+labels.grade <- c("1", 
+                 "2", 
+                 "3")
+
+labels.nodes <- c("0 nodes", 
+               "1–3 nodes", 
+               "4–9 nodes", 
+               "10+ nodes")
+
+labels.age <- c("<= 30", "31–45", "46-60", "61+")
+
+labels.size <- c("(0mm - 10mm]",
+                 "(10mm - 20mm]",
+                 "(20mm - 30mm]",
+                 "(30mm - 50mm]", 
+                 "> 50mm")
+
+data <- data %>% mutate(
+  hormone_status = factor(paste0(er, pr), 
+    levels = c("00", "01", "10", "11"),
+    labels = labels.erpr),
+  grade = factor(grade),
+  menopause = factor(menopause),
+  nodes_group = factor(
+    case_when(
+      nodes == 0 ~ "0 nodes",
+      nodes <= 3 ~ "1–3 nodes",
+      nodes <= 9 ~ "4–9 nodes",
+      nodes >= 10 ~ "10+ nodes"
+      ),
+    levels = c("0 nodes", 
+               "1–3 nodes", 
+               "4–9 nodes", 
+               "10+ nodes"),
+    labels = labels.nodes),
+  age_group = factor(
+    case_when(
+      age <= 30 ~ "<= 30",
+      age <= 45 ~ "31–45",
+      age <= 60 ~ "46-60",
+      age >= 61 ~ "61+"
+      ),
+    levels = labels.age,
+    labels = labels.age),
+  size_group = factor(
+    case_when(
+      size <= 10 ~ "(0mm - 10mm]",
+      size <= 20 ~ "(10mm - 20mm]",
+      size <= 30 ~ "(20mm - 30mm]",
+      size <= 50 ~ "(30mm - 50mm]",
+      size > 50 ~ "> 50mm",
+      ),
+    levels = labels.size,
+    labels = labels.size)
+  )
+  
+```
+
+```{r}
+
+#labelling function 
+appender <- function(string, suffix = "-foo") paste0(string, suffix)
+
+
+data$grade = as_factor(data$grade)
+# Plot
+data %>% 
+  ggplot( aes(x=size, y=nodes, colour=grade, fill=grade)) +
+    geom_point(size=3) +
+  scale_color_viridis_d() + 
+    theme(legend.position="none") +
+    theme_minimal() +
+    theme(
+      panel.spacing = unit(0.5, "lines"),  # Space between facets
+      strip.text.x = element_text(size = 8),
+      strip.text.y = element_text(size = 8),
+      plot.title = element_text(size = 13)
+    ) +
+    facet_grid(rows=vars(er), cols=vars(pr), 
+      labeller = labeller(
+        er = c(`0` = "ER Negative", `1` = "ER Positive"),
+        pr = c(`0` = "PR Negative", `1` = "PR Positive")
+      )
+      ) +
+  labs(x = "Size of tumour (mm)", 
+       y = "Number of positive lymph nodes") 
+```
+
+```{r, echo=FALSE, out.height=200%}
+
+
+# Label mappings for facets
+label_er_pr <- list(
+  er = c(`0` = "ER Negative", `1` = "ER Positive"),
+  pr = c(`0` = "PR Negative", `1` = "PR Positive")
+)
+
+# Convert er and pr to factors with labels for plotting
+data <- data %>%
+  mutate(
+    er_fct = factor(er, levels = c(0, 1), labels = c("ER Negative", "ER Positive")),
+    pr_fct = factor(pr, levels = c(0, 1), labels = c("PR Negative", "PR Positive")),
+    grade = factor(grade)
+  )
+
+# 1. violin plots of age, year of diagnosis, number of positive nodes, tumour size
+
+
+# tumour size by grade and hormone status
+ggplot(data, aes(x = er_fct, y = size, fill = grade)) +
+  geom_violin(scale = "width", position = position_dodge(0.8)) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(x = "Hormone receptor status", y = "Tumour size (mm)", color =  "Grade") +
+    facet_grid(pr_fct~1, scales="free") + 
+    theme(aspect_ratio = 0.8)
+ggsave("figures/gbcs/size_grade_hormone.png")
+
+
+# nodes by grade and hormone status
+ggplot(data, aes(x = er_fct, y = nodes, fill = grade)) +
+  geom_violin(scale = "width", position = position_dodge(0.8)) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(x = "Hormone receptor status", y = "Positive nodes", color =  "Grade")  +
+    facet_grid(pr_fct~1, scales="free") +
+    theme(aspect_ratio = 0.8)
+ggsave("figures/gbcs/nodes_grade_hormone.png")
+
+# age by grade and hormone status
+ggplot(data, aes(x = er_fct, y = age, fill = grade)) +
+    geom_violin(scale = "width", position = position_dodge(0.8)) +
+    theme_minimal() +
+    labs(x = "Hormone receptor status", y = "Age at diagnosis (years)", color = "Grade")  +
+    facet_grid(pr_fct~1, scales="free") 
+
+ggsave("figures/gbcs/age_grade_hormone.png")
+
+# tumour size by screening method
+
+
+# nodes by screening method
+
+
+# tumour size by her2 status
+
+
+# nodes by her2 status 
+
+# combine with patchwork ?
+p1 / p2 / p3 + plot_layout(guides = "collect") 
+```
+
+
+
+
+```{r}
+# nodes by menopausal status
+p1 <- ggplot(data, aes(nodes, fill = menopause, after_stat(density))) +
+    geom_histogram(bins = 40) +
+    theme_minimal() +
+  scale_color_viridis_d() +
+  labs(x = "Positive nodes", y = "density", color =  "Menopausal status")
+
+p1
+
+# tumour size by menopausal status
+p2 <- ggplot(data, aes(nodes, fill = menopause, after_stat(density))) +
+    geom_histogram(bins = 40) +
+    theme_minimal() +
+  scale_color_viridis_d() +
+  labs(x = "Tumour size (mm)", y = "density", color =  "Menopausal status")
+
+p2
+
+# nodes by hormone receptor status
+p1 <- ggplot(data, aes(nodes, fill = grade, after_stat(density))) +
+    geom_density(bins = 40) +
+    theme_minimal() +
+  scale_color_viridis_d() +
+  labs(x = "Positive nodes", y = "density", color =  "grade")
+
+p1
+
+# grade by menopausal status
+p2 <- ggplot(data, aes(nodes, fill = menopause, after_stat(density))) +
+    geom_histogram(bins = 40) +
+    theme_minimal() +
+  scale_color_viridis_d() +
+  labs(x = "Tumour size (mm)", y = "density", color =  "Menopausal status")
+
+p2
+
+
+
+
+
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Prepare grouped ER/PR label and factor grade
+data <- data %>%
+  mutate(
+    er_fct = factor(er, levels = c(0, 1), labels = c("ER Negative", "ER Positive")),
+    pr_fct = factor(pr, levels = c(0, 1), labels = c("PR Negative", "PR Positive")),
+    grade = factor(grade),
+    er_pr = paste0(er_fct, " / ", pr_fct)
+  )
+
+# Reshape to long format
+long_data <- data %>%
+  select(er_pr, grade, age, year, nodes, size) %>%
+  pivot_longer(cols = c(age, year, nodes, size), names_to = "variable", values_to = "value")
+
+# Plot
+ggplot(long_data, aes(x = er_pr, y = value, fill = grade)) +
+  geom_violin(scale = "width", trim = FALSE, position = position_dodge(0.8)) +
+  geom_boxplot(width = 0.1, fill = "white", position = position_dodge(0.8), outlier.shape = NA) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_fill_viridis_d(name = "Grade") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Distribution of variables by ER/PR status and grade",
+    x = "ER / PR Status",
+    y = NULL
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+```
+
+
+
+```{r kaplan meier curves}
+library(survival)
+library(survminer)
+library(dplyr)
+
+surv_obj <- Surv(time = data$survtime, 
+                 event = data$censdead)
+
+
+# by hormone status
+fit_er <- survfit(surv_obj ~ er, data = data)
+
+ggsurvplot(
+  fit_er,
+  data = data,
+  palette = "viridis",
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend = "bottom",
+  legend.title = "Estrogen receptor status",
+  legend.labs = c("ER-", "ER+"),
+  pval = TRUE, 
+  conf.int = TRUE,
+  #risk.table = TRUE,
+  #tables.height = 0.5,
+  ggtheme = theme_minimal()
+) 
+ggsave("figures/gbcs/survival_estrogen.png")
+
+fit_pr <- survfit(surv_obj ~ pr, data = data)
+
+ggsurvplot(
+  fit_pr,
+  data = data,
+  palette = "viridis",
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend = "bottom",
+  legend.title = "Progesterone receptor status",
+  legend.labs = c("PR-", "PR+"),
+  pval = TRUE, 
+  conf.int = TRUE,
+  #risk.table = TRUE,
+  #tables.height = 0.5,
+  ggtheme = theme_minimal()
+) 
+ggsave("figures/gbcs/survival_progesterone.png")
+
+
+
+# by grade
+fit_grade <- survfit(surv_obj ~ grade, data = data)
+
+ggsurvplot(
+  fit_grade,
+  data = data,
+  palette = "viridis",
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend = "bottom",
+  pval = TRUE, 
+  conf.int = TRUE,
+  legend.title = "Grade",
+  legend.labs = labels.grade,
+  #risk.table = TRUE,
+  #tables.height = 0.5,
+  ggtheme = theme_minimal() 
+) 
+ggsave("figures/gbcs/survival_grade.png")
+
+
+# by size group
+fit_size <- survfit(surv_obj ~ size_group, data = data)
+labels.size.temp <- factor(labels.size) %>% levels()
+ggsurvplot(
+  fit_size,
+  data = data,
+  palette = "viridis",
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend = "bottom",
+  pval = TRUE, 
+  conf.int = TRUE,
+  legend.title = "Tumour size",
+  legend.labs = labels.size.temp,
+  #risk.table = TRUE,
+  #tables.height = 0.5,
+  ggtheme = theme_minimal() 
+) 
+ggsave("figures/gbcs/survival_size.png")
+
+# by nodes
+fit_nodes <- survfit(surv_obj ~ nodes_group, data = data)
+labels.nodes.temp <- c("1–3 nodes", 
+               "4–9 nodes", 
+               "10+ nodes")
+ggsurvplot(
+  fit_nodes,
+  data = data,
+  palette = "viridis",
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend = "bottom",
+  pval = TRUE, 
+  conf.int = TRUE,
+  legend.title = "Positive nodes",
+  legend.labs = labels.nodes.temp,
+  #risk.table = TRUE,
+  #tables.height = 0.5,
+  ggtheme = theme_minimal() 
+) 
+ggsave("figures/gbcs/survival_nodes.png")
+
+
+data %>% filter(hormone_status == "ER-, PR-")
+
+# 3. Optionally by Grade or Combined ER/PR Stat
+
+```
+

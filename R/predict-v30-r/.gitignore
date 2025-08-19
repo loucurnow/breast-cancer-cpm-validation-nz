@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.idea/
+.calva/
+.clj-kondo/.cache
+.clj-kondo/
+.lsp/.cache
+.lsp/

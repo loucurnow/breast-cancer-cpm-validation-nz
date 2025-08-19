@@ -1,0 +1,26 @@
+{
+    "id": "623EBA76",
+    "path": "C:/Users/loucu/Coding_Projects/breast-cancer-cpm-validation/R/example_survival_tree.R",
+    "project_path": "example_survival_tree.R",
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1744853800064.0,
+    "source_on_save": false,
+    "relative_order": 1,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "19,0",
+        "scrollLine": "0"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1744855051,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1744855051,
+    "read_only": false,
+    "read_only_alternatives": []
+}
