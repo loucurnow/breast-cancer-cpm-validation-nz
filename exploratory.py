@@ -14,8 +14,11 @@ from preprocessing import load_gbcscs
 # should work for both bcf and german datasets
 def summarise_vars():
     """
+    BCFNR:
 
-    vars:
+
+
+    general summary:
         total number of participants
         median followup (years)
         number of breast cancer deaths
