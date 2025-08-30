@@ -47,6 +47,28 @@ def shuffle_and_split_data(data, test_ratio):
     return data.iloc[train_indices], data.iloc[test_indices]
 
 
+def test():
+    demographics = Path('datasets/bcfnz/Demographic Data_DeIdentified.xlsx')
+    workup = Path('datasets/bcfnz/Workup_DeIdentified.xlsx')
+
+    biomarkers = Path('datasets/bcfnz/Biomarkers_DeIdentified.xlsx')
+
+    lesions = Path('datasets/bcfnz/Lesions_DeIdentified.xlsx')
+    mets = Path('datasets/bcfnz/MetastaticDisease_DeIdentified.xlsx')
+
+    surgery = Path('datasets/bcfnz/Primary Surgery_DeIdentified.xlsx')
+
+    therapy_radio = Path('datasets/bcfnz/Radiotherapy_DeIdentified.xlsx')
+    therapy_chemo = Path('datasets/bcfnz/Chemotherapy_DeIdentified.xlsx')
+    therapy_bio = Path('datasets/bcfnz/BiologicalTherapy_DeIdentified.xlsx')
+    therapy_hormone = Path('datasets/bcfnz/HormoneTherapy_DeIdentified.xlsx')
+
+    followup = Path('datasets/bcfnz/Followup_DeIdentified.xlsx')
+
+    
+
+
+
 if __name__ == '__main__':
     data = load_gbcscs()
     print(tabulate(data, headers='keys', tablefmt='plain'))
