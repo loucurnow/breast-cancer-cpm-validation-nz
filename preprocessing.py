@@ -1,5 +1,4 @@
 from pathlib import Path
-import numpy as np
 import pandas as pd
 import tarfile
 import urllib.request
@@ -7,7 +6,7 @@ import pyreadr
 import matplotlib.pyplot as plt
 from tabulate import tabulate
 
-from derived_vars import tumour_size_group_path_stage_groupings
+from derived_vars import tumour_size_group_path_stage_groupings, brca_result
 
 
 def load_gbcscs():
@@ -35,7 +34,18 @@ def load_gbcscs():
         df = pd.read_csv(processed_path, index_col='id')
 
         df.to_csv(processed_path)
-    return df
+    return
+
+
+def load_treatments_bcfnz():
+    surgery = pd.read_excel(Path('datasets/bcfnz/Primary Surgery_DeIdentified.xlsx'))
+
+    therapy_radio = pd.read_excel(Path('datasets/bcfnz/Radiotherapy_DeIdentified.xlsx'))
+    therapy_chemo = pd.read_excel(Path('datasets/bcfnz/Chemotherapy_DeIdentified.xlsx'))
+    therapy_bio = pd.read_excel(Path('datasets/bcfnz/BiologicalTherapy_DeIdentified.xlsx'))
+    therapy_hormone = pd.read_excel(Path('datasets/bcfnz/HormoneTherapy_DeIdentified.xlsx'))
+
+    return
 
 
 def load_bcfnz():
@@ -74,12 +84,142 @@ def load_bcfnz():
 
 
     """
-    workup_df = 1
 
-    return workup_df
+    demographics = pd.read_excel(Path('datasets/bcfnz/Demographic Data_DeIdentified.xlsx'))
+
+    demographics['brca'] = demographics.apply(brca_result, axis=1).astype("category")
+    # print(demographics["brca"].value_counts())
+    # 43009 = unknown or not tested
+    # 1647 = tested & negative
+    # 459 = tested & positive
+
+    demographics['diagnosis_year'] = demographics['DateOfTissueDiagnosis'].dt.year
+    demographics['surv'] = demographics["Current Patient Status"].apply(
+        lambda x:
+        1 if x == 'Alive' else
+        0 if x == "Dead"
+        else 9)
+
+    demographics['survtime'] = (demographics['Date Of Death'] - demographics['DateOfTissueDiagnosis']).dt.days
+    demographics['death_cause'] = demographics['Cause Of Death'].apply(
+        lambda x:
+        1 if x == 'Breast cancer' else
+        2 if x == 'Other' else
+        9 if x == 'Unknown' else
+        None
+    )
+    demographics['death_cause_verified'] = demographics['Cause Of Death Verified By MOH'].apply(
+        lambda x:
+        1 if x == 'Yes' else
+        0 if x == 'No' else
+        None
+    )
+    demographics['death_icd_code'] = demographics['ICDCodeOfTheCauseOfDeath'].str.lower()
+
+    # drop unnecessary columns
+    demographics = demographics.drop(columns=['DateOfTissueDiagnosis', "Date Of Death",
+                                              'Genetic test result (BRCA1)',
+                                              'Genetic test result (BRCA2)',
+                                              'Current Patient Status',
+                                              'Cause Of Death',
+                                              'Cause Of Death Verified By MOH',
+                                              'ICDCodeOfTheCauseOfDeath'])
+
+    demographics.rename(columns={"Ethnicity (Level 1)": "ethnicity",
+                                 "Gender": "gender",
+                                 "Region": "region",
+                                 "Age At Diagnosis": "diagnosis_age"}, inplace=True)
+
+    print(demographics[['death_cause']].value_counts())
+    print(demographics[['death_cause_verified']].value_counts())
+    print(demographics[['death_icd_code']].value_counts())
+
+    test = demographics[demographics['death_cause_verified'] == 0]
+    print(test['death_cause'].value_counts())
+
+    print(demographics.head().to_markdown())
+    print(demographics.columns)
+    del demographics
+
+    workup = pd.read_excel(Path('datasets/bcfnz/Workup_DeIdentified.xlsx'))
+    """
+    DiagnosisType
+    Invasive & in situ    19161
+    Invasive              17329
+    In situ                 494
+    Unknown                  66
+    """
+    workup['invasive'] = workup['DiagnosisType'].apply(lambda x:
+                                                       1 if x == 'Invasive & in situ' or x == 'Invasive'
+                                                       else 0)
+
+    workup['primary_surgery'] = workup['PrimarySurgery'].apply(lambda x:
+                                                               1 if x == 'Yes'
+                                                               else 0 if x == 'No'
+                                                               else 9)
+
+    workup['symptomatic'] = workup['DidThePatientPresentWithSymptomsAtTimeOfReferral'].apply(lambda x:
+                                                                                             1 if x == 'Yes'
+                                                                                             else 0 if x == 'No'
+                                                                                             else 9)
+    print(workup['symptomatic', 'DidThePatientPresentWithSymptomsAtTimeOfReferral'].value_counts())
+
+    workup['referral_source'] = workup['SourceOfReferral'].apply(
+        lambda x:
+        0 if x == 'BreastScreen Aotearoa' or x == 'Screen detected - non BSA'
+        else 1 if x == 'GP (symptomatic)'
+        else 9 if x == 'Unknown'
+        else 3
+    )
+
+    print(workup['SourceOfReferral'].value_counts())
+    print(workup['referral_source'].value_counts())
+
+    workup['neoadj_radiation'] = workup['PrimaryOrNeoAdjuvantRadiationTherapy'].apply(
+        lambda x:
+        0 if x == 'Not referred - deemed not necessary' or x == 'Referred - deemed not necessary'
+        else 1 if x == 'Yes'
+        else 2 if x == 'Referred - patient unfit' or x == 'Not referred - patient unfit'
+        else 3 if x == 'Referred - patient declined' or x == 'Not referred - patient declined'
+        else 99 if x == 'n/a - treatment for metastatic disease'
+        else 9
+    )
+
+    print(workup['neoadj_radiation'].value_counts())
+
+    print(workup['invasive'].value_counts())
+
+    print(workup['MetastaticDisease'].value_counts())
+    print(workup['primary_surgery'].value_counts())
+
+    workup = workup.drop(columns=['PrimarySurgery',
+                                  "DidThePatientPresentWithSymptomsAtTimeOfReferral",
+                                  'DiagnosisType'])
+
+    print(workup.head().to_markdown())
+
+    del workup
+
+    biomarkers = pd.read_excel(Path('datasets/bcfnz/Biomarkers_DeIdentified.xlsx'))
+    print(biomarkers.head().to_markdown())
+    print(biomarkers.columns)
+    del biomarkers
+
+    lesions = pd.read_excel(Path('datasets/bcfnz/Lesions_DeIdentified.xlsx'))
+    print(lesions.head().to_markdown())
+    print(lesions.columns)
+    del lesions
+
+    # allow mets cases if they are diagnosed with mets > 1 mo ? after their primary surgery
+    mets = pd.read_excel(Path('datasets/bcfnz/MetastaticDisease_DeIdentified.xlsx'))
+    followup = Path('datasets/bcfnz/Followup_DeIdentified.xlsx')
+
+    result = pd.DataFrame()
+
+    return result
 
 
-def load_bcfnz_extended():
+def load_bcfnz_filter_cohort():
     """
         processed_path = Path('datasets/gbcsCS_processed.csv')
 
@@ -87,12 +227,16 @@ def load_bcfnz_extended():
     :return:
     """
     df = load_bcfnz()
+
+    # filter to gender == female
+    # total female = 44810/45115
+    # print(df[['gender']].value_counts())
+    demographics = df[df['gender'] == 'Female']
+
     return df
 
 
-
 def shuffle_and_split_data(data, test_ratio):
-
     shuffled_indices = np.random.permutation(len(data))
     test_set_size = int(len(data) * test_ratio)
     test_indices = shuffled_indices[:test_set_size]
@@ -100,28 +244,6 @@ def shuffle_and_split_data(data, test_ratio):
     return data.iloc[train_indices], data.iloc[test_indices]
 
 
-def test():
-    demographics = Path('datasets/bcfnz/Demographic Data_DeIdentified.xlsx')
-    workup = Path('datasets/bcfnz/Workup_DeIdentified.xlsx')
-
-    biomarkers = Path('datasets/bcfnz/Biomarkers_DeIdentified.xlsx')
-
-    lesions = Path('datasets/bcfnz/Lesions_DeIdentified.xlsx')
-    mets = Path('datasets/bcfnz/MetastaticDisease_DeIdentified.xlsx')
-
-    surgery = Path('datasets/bcfnz/Primary Surgery_DeIdentified.xlsx')
-
-    therapy_radio = Path('datasets/bcfnz/Radiotherapy_DeIdentified.xlsx')
-    therapy_chemo = Path('datasets/bcfnz/Chemotherapy_DeIdentified.xlsx')
-    therapy_bio = Path('datasets/bcfnz/BiologicalTherapy_DeIdentified.xlsx')
-    therapy_hormone = Path('datasets/bcfnz/HormoneTherapy_DeIdentified.xlsx')
-
-    followup = Path('datasets/bcfnz/Followup_DeIdentified.xlsx')
-
-    
-
-
-
 if __name__ == '__main__':
-    data = load_gbcscs()
+    data = load_bcfnz()
     print(tabulate(data, headers='keys', tablefmt='plain'))
