@@ -1,51 +1,524 @@
 from pathlib import Path
 import pandas as pd
-import tarfile
-import urllib.request
-import pyreadr
 import matplotlib.pyplot as plt
 from tabulate import tabulate
+import numpy as np
+import os
 
-from derived_vars import tumour_size_group_path_stage_groupings, brca_result
+from derived_vars import tumour_size_group_path_stage_groupings, brca_result, her2_result
 
 
-def load_gbcscs():
-    processed_path = Path('datasets/gbcsCS_processed.csv')
+def load_followup_bcfnz():
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/followup.pickle')):
+        cols = ['patient_no', 'workup_no', 'followup_lrr', 'followup_mets', 'followup_surv',
+                'has_second_primary', 'rectime']
 
-    if not processed_path.is_file():
-        df = pd.read_csv('datasets/gbcsCS_raw.csv')
+        followup = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/followup.pickle'))
 
-        # calculate hormone receptor thresholds
-        df['er_status'] = df['estrg_recp'].apply(lambda x: x >= 20)
-        df['pr_status'] = df['prog_recp'].apply(lambda x: x >= 20)
+        followup.rename(columns={"PatientNo": "patient_no",
+                                 "WorkupNo": "workup_no"}, inplace=True)
 
-        df['size_group_t_stage'] = df['size'].apply(tumour_size_group_path_stage_groupings)
+        def add_disease_status(df: pd.DataFrame) -> pd.DataFrame:
+            """
+            prefer metastatic,
+            """
+            col = 'Evidence of disease: type'
+            df = df.copy()
 
-        df['size_group_quartiles'] = pd.qcut(df['size'], q=4)
+            df.loc[df[col].str.contains('Loco-regional recurrence', na=False), 'followup_lrr'] \
+                = 1
 
-        df['diagnosis_year'] = df['diagdateb'].dt.year
+            df.loc[df[col].str.contains('Metastatic', na=False), 'followup_mets'] \
+                = 1
 
-        # cols missing from this dataset, but in the BCFNR data:
-        df['her2'] = None
-        df['ki67'] = None
+            return df
 
-        df.to_csv(processed_path, index=False)
-    else:
-        df = pd.read_csv(processed_path, index_col='id')
+        followup = add_disease_status(followup)
 
-        df.to_csv(processed_path)
-    return
+        followup['followup_surv'] = (
+            followup['PatientStatus']
+            .map({'Alive': 1, 'Deceased': 0})
+            .fillna(9)
+        )
+
+        followup['has_second_primary'] = followup['SecondPrimaryCarcinoma'].notna().astype(int)
+
+        cleaned = followup['DateOfDefinitiveDiagnosisOfNewPrimary'].replace(
+            r'\s00:00:00$',  # exclude some invalid dates in the data
+            pd.NA,
+            regex=True
+        )
+
+        followup['rectime'] = (
+                pd.to_datetime(cleaned, errors='coerce') - followup[
+            'DateOfTissueDiagnosis']).dt.days
+
+        followup = followup[cols]
+
+        followup.to_pickle('datasets/bcfnz/pickle/processed/followup.pickle')
+
+    return pd.read_pickle('datasets/bcfnz/pickle/processed/followup.pickle')
 
 
 def load_treatments_bcfnz():
-    surgery = pd.read_excel(Path('datasets/bcfnz/Primary Surgery_DeIdentified.xlsx'))
+    treatments = load_workup_treatments()
 
-    therapy_radio = pd.read_excel(Path('datasets/bcfnz/Radiotherapy_DeIdentified.xlsx'))
-    therapy_chemo = pd.read_excel(Path('datasets/bcfnz/Chemotherapy_DeIdentified.xlsx'))
-    therapy_bio = pd.read_excel(Path('datasets/bcfnz/BiologicalTherapy_DeIdentified.xlsx'))
-    therapy_hormone = pd.read_excel(Path('datasets/bcfnz/HormoneTherapy_DeIdentified.xlsx'))
+    # from surgery, need to extract: did they have surgery?
+    # need to refer to matthew's work here,don't have med knowledge req to understand his filtering
+    surgery = process_surgery()
 
-    return
+    for t in ['hormone', 'biological', 'chemo', 'radio']:
+        therapy_df = pd.read_pickle(Path(f'datasets/bcfnz/pickle/unprocessed/therapy_{t}.pickle'))
+        therapy_df = clean_therapy_df(therapy_df, t)
+
+        if t == 'radio':
+            print(therapy_df.info(verbose=True))
+
+        treatments = treatments.merge(therapy_df, on=['patient_no', 'workup_no'], how='outer')
+
+    return treatments
+
+
+def process_surgery():
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/surgery.pickle')):
+        surgery = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/surgery_primary.pickle'))
+
+        surgery.rename(columns={"PatientNo": "patient_no",
+                                "WorkupNo": "workup_no",
+                                "DateOfSurgery": "date_of_primary_surgery",
+                                "DateOfTissueDiagnosis": "date_of_tissue_diagnosis"
+                                }, inplace=True)
+
+        surgery['date_of_primary_surgery'] = pd.to_datetime(surgery['date_of_primary_surgery'], errors='coerce')
+        surgery['date_of_tissue_diagnosis'] = pd.to_datetime(surgery['date_of_tissue_diagnosis'], errors='coerce')
+
+        # time from diagnosis until surgery
+        surgery['surgtime'] = (surgery['date_of_primary_surgery'] - surgery['date_of_tissue_diagnosis']).dt.days
+
+        # check duplicates of id cols
+        id_cols = ["patient_no", "workup_no", "date_of_primary_surgery", "date_of_tissue_diagnosis"]
+        value_cols = [
+            "LeftBreastTypeOfAxillarySurgery",
+            "RightBreastTypeOfAxillarySurgery",
+            "LeftBreastTypeOfBreastSurgery",
+            "RightBreastTypeOfBreastSurgery",
+            "LeftBreastIgeCode",
+            "RightBreastIgeCode"
+        ]
+
+        # pivot wide to long to a
+        # split side + variable
+        ids = surgery[id_cols]
+        surg = surgery[value_cols].copy()
+        col_split = surg.columns.str.extract(
+            r'^(Left|Right)Breast(.*)'
+        )
+
+        surg.columns = pd.MultiIndex.from_arrays(
+            [col_split[0].str.lower(), col_split[1]],
+            names=["breast_side", "variable"]
+        )
+
+        # reshape
+        long = (
+            surg.stack("breast_side")
+                .reset_index()
+                .rename(columns={"level_0": "row_id"})
+        )
+
+        # add IDs back
+        long = long.join(ids, on="row_id")
+
+        # reorder columns
+        long = long[
+            id_cols
+            + ["breast_side", "TypeOfBreastSurgery", "TypeOfAxillarySurgery", "IgeCode"]
+        ]
+
+        long.rename(columns={"TypeOfBreastSurgery": "surgery_type",
+                             "TypeOfAxillarySurgery": "axillary_surgery_type",
+                             "IgeCode": "ige_code"}, 
+                             inplace=True)
+
+        long.to_pickle('datasets/bcfnz/pickle/processed/surgery_primary.pickle')
+
+    return long
+
+
+def load_workup_treatments():
+    cols = ['workup_no', 'patient_no',
+            'neoadj_radiation', 'neoadj_chemo', 'neoadj_biological', 'neoadj_hormone',
+            'adj_radiation', 'adj_chemo', 'adj_biological', 'adj_hormone',
+            'ovarian_ablation']
+
+    df = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/workup.pickle'))
+
+    df.rename(columns={"PatientNo": "patient_no",
+                       "WorkupNo": "workup_no",
+                       "AnyCancerTreatment": "had_treatment"}, inplace=True)
+
+    # neo-adjuvant therapies
+    df['neoadj_radiation'] = df['PrimaryOrNeoAdjuvantRadiationTherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+
+    df['neoadj_chemo'] = df['NeoAdjuvantChemotherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+    df['neoadj_biological'] = df['NeoAdjuvantBiologicalTherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+    df['neoadj_hormone'] = df['PrimaryOrNeoAdjuvantHormoneTherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+    # adjuvant therapies
+    df['adj_radiation'] = df['AdjuvantRadiationTherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+    df['adj_chemo'] = df['AdjuvantChemotherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+    df['adj_biological'] = df['AdjuvantBiologicalTherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+    df['adj_hormone'] = df['AdjuvantHormoneTherapy'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+    df['ovarian_ablation'] = df['OvarianAblation'].apply(
+        lambda x: workup_therapy_map(x)
+    )
+
+    df = df[cols]
+
+    return df
+
+
+def clean_therapy_df(df, therapy_type: str):
+    therapy_type = therapy_type.lower()
+
+    if therapy_type not in ('biological', 'hormone', 'radio', 'chemo'):
+        raise ValueError("therapy_type must be one of 'biological', 'hormone', 'radio', 'chemo'")
+
+    rename_map = {
+        r'PatientNo': 'patient_no',
+        r'WorkupNo': 'workup_no'
+    }
+
+    if therapy_type == 'biological':
+        rename_map.update({
+            r'StartDateBiologicalTherapy': 'start_date',
+            r'StopDateBiologicalTherapy': 'stop_date',
+            r'TimingOfBiologicalTherapy': 'timing',
+            r'BiologicalTherapy': 'therapy_name'
+        })
+
+    elif therapy_type == 'hormone':
+        rename_map.update({
+            r'StartDateOfHormoneTherapy': 'start_date',
+            r'StopDateHormoneTherapy': 'stop_date',
+            r'TimingOfHormoneTherapy': 'timing',
+            r'HormoneTherapy': 'therapy_name',
+            r'DiscontinuedHormoneTherapy': 'discontinued_hormone'
+        })
+
+    elif therapy_type == 'chemo':
+        rename_map.update({
+            r'StartDateOfChemotherapy': 'start_date',
+            r'TimingOfChemotherapy': 'timing',
+            r'TypeOfChemotherapy': 'chemo_type',
+            r'TypeOfChemotherapyRegimen': 'chemo_regimen_type',
+            r'CompletedAsPlannedChemotherapy': 'chemo_completed',
+            r'NumberOfCycles': 'chemo_cycles'
+        })
+
+    elif therapy_type == 'radio':
+        df.columns = (
+            df.columns
+                .str.replace(r"Timing Of Radiation Therapy.*", "timing", regex=True)
+                .str.replace(r"Total Dose.*", "total_dose", regex=True)
+                .str.replace(r"Radiation Type.*", "radiation_type", regex=True)
+        )
+
+    df = df.rename(columns=rename_map)
+
+    # add column for time from diagnosis to therapy
+    if 'start_date' in df.columns:
+        df['start_date'] = pd.to_datetime(df['start_date'], errors='coerce')
+        df['DateOfTissueDiagnosis'] = pd.to_datetime(df['DateOfTissueDiagnosis'], errors='coerce')
+
+        # time from diagnosis until trt
+        df['diagnosis_to_treatment_time'] = (df['start_date'] - df['DateOfTissueDiagnosis']).dt.days
+
+
+    # drop the region and dateoftissuediagnosis columns
+    df = df.drop(columns=["DateOfTissueDiagnosis", "Region"])
+
+    return df
+
+
+def process_demographics():
+    cols = ['patient_no', 'workup_no',
+            'ethnicity', 'gender', 'region', 'diagnosis_age',
+            'brca', 'diagnosis_year', 'surv', 'survtime',
+            'death_cause', 'death_cause_verified', 'death_icd_code']
+
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/demographics.pickle')):
+        demographics = pd.read_pickle(f"datasets/bcfnz/pickle/unprocessed/demographics.pickle")
+
+        demographics.rename(columns={"PatientNo": "patient_no",
+                                     "WorkupNo": "workup_no",
+                                     "Ethnicity (Level 1)": "ethnicity",
+                                     "Gender": "gender",
+                                     "Region": "region",
+                                     "Age At Diagnosis": "diagnosis_age"}, inplace=True)
+
+        demographics['brca'] = demographics.apply(brca_result, axis=1).astype("category")
+        # print(demographics["brca"].value_counts())
+        # 43009 = unknown or not tested
+        # 1647 = tested & negative
+        # 459 = tested & positive
+
+        demographics['diagnosis_year'] = demographics['DateOfTissueDiagnosis'].dt.year
+        demographics['surv'] = demographics["Current Patient Status"].apply(
+            lambda x:
+            1 if x == 'Alive' else
+            0 if x == "Dead"
+            else 9)
+
+        demographics['survtime'] = (demographics['Date Of Death'] - demographics['DateOfTissueDiagnosis']).dt.days
+
+        demographics['death_cause'] = demographics['Cause Of Death'].apply(
+            lambda x:
+            1 if x == 'Breast cancer' else
+            2 if x == 'Other' else
+            9 if x == 'Unknown' else
+            None
+        )
+        demographics['death_cause_verified'] = demographics['Cause Of Death Verified By MOH'].apply(
+            lambda x:
+            1 if x == 'Yes' else
+            0 if x == 'No' else
+            None
+        )
+        demographics['death_icd_code'] = demographics['ICDCodeOfTheCauseOfDeath'].str.lower()
+
+        demographics = demographics[cols]
+
+        demographics.to_pickle("datasets/bcfnz/pickle/processed/demographics.pickle")
+
+    return pd.read_pickle("datasets/bcfnz/pickle/processed/demographics.pickle")
+
+
+def process_workup():
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/workup.pickle')):
+        cols = ['patient_no', 'workup_no', 'invasive',
+                'metastatic', 'primary_surgery', 'symptomatic',
+                'referral_source', 'pregnancy_current_or_recent', 'post_menopausal',
+                'previous_surgery_breast_cancer',
+                'smoker', 'height', 'weight',
+                'ecog', 'charlson_comorbidities', 'charlson_comorbidity_score']
+
+        workup = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/workup.pickle'))
+
+        workup.rename(columns={"PatientNo": "patient_no",
+                               "WorkupNo": "workup_no",
+                               "CharlsonComorbidityScore": 'charlson_comorbidity_score',
+                               "CharlsonComorbidities": "charlson_comorbidities"}, inplace=True)
+
+        """
+        DiagnosisType
+        Invasive & in situ    19161
+        Invasive              17329
+        In situ                 494
+        Unknown                  66
+        """
+        workup['invasive'] = workup['DiagnosisType'].apply(lambda x:
+                                                           1 if x == 'Invasive & in situ' or x == 'Invasive'
+                                                           else 0)
+
+        workup['metastatic'] = workup['MetastaticDisease'].apply(lambda x:
+                                                                 1 if x == 'Yes'
+                                                                 else 0 if x == 'No'
+                                                                 else 9)
+
+        workup['primary_surgery'] = workup['PrimarySurgery'].apply(lambda x:
+                                                                   1 if x == 'Yes'
+                                                                   else 0 if x == 'No'
+                                                                   else 9)
+
+        workup['symptomatic'] = workup['DidThePatientPresentWithSymptomsAtTimeOfReferral'].apply(lambda x:
+                                                                                                 1 if x == 'Yes'
+                                                                                                 else 0 if x == 'No'
+                                                                                                 else 9)
+
+        workup['referral_source'] = workup['SourceOfReferral'].apply(
+            lambda x:
+            0 if x == 'BreastScreen Aotearoa' or x == 'Screen detected - non BSA'
+            else 1 if x == 'GP (symptomatic)'
+            else 9 if x == 'Unknown'
+            else 3
+        )
+
+        workup['previous_surgery_breast_cancer'] = workup['PreviousBreastCancerSurgery'].apply(
+            lambda x:
+            1 if x == 'Same breast' or x == 'Both breasts'
+            else 2 if x == 'Contralateral breast'
+            else None
+        )
+
+        workup['ECOGStatus'] = workup.ECOGStatus.str.extract(r"(\d+)")
+        workup['ecog'] = workup.ECOGStatus.apply(lambda x: 9 if x == 99 else x).fillna(9)
+
+        workup['height'] = workup['HeightAtDiagnosis'].apply(lambda x:
+                                                             None if x >= 999 else x)
+
+        workup['weight'] = workup['WeightAtDiagnosis'].apply(lambda x:
+                                                             None if x >= 999 or x < 25 else x)
+
+        workup['post_menopausal'] = workup['MenopausalStatus'].apply(
+            lambda x:
+            1 if x == 'Post-menopausal'
+            else 0 if x == 'Pre-menopausal' or x == 'Peri-menopausal'
+            else 9
+        )
+
+        workup['pregnancy_current_or_recent'] = workup['GestationalStatusAtDiagnosis'].apply(
+            lambda x:
+            1 if x == 'Currently pregnant' or x == 'Recently pregnant'
+            else 0
+        )
+
+        workup['smoker'] = workup['SmokingStatus'].apply(
+            lambda x:
+            1 if x == 'Current smoker' or x == 'Ex-smoker < 12 months'
+            else 0 if x == 'Never smoked' or x == 'Ex-smoker > 12 months'
+            else 9
+        )
+
+        workup = workup[cols]
+
+        workup.to_pickle(Path('datasets/bcfnz/pickle/processed/workup.pickle'))
+
+    return pd.read_pickle("datasets/bcfnz/pickle/processed/workup.pickle")
+
+
+def process_biomarkers():
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/biomarkers.pickle')):
+        biomarkers = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/biomarkers.pickle'))
+
+        cols = ['patient_no', 'workup_no',
+                'her2_result', 'ki67_result', 'oncotypedx_result'
+                ]
+
+        biomarkers.rename(columns={"PatientNo": "patient_no",
+                                   "WorkupNo": "workup_no"}, inplace=True)
+
+        biomarkers['her2_result_ihc'] = biomarkers['ResultOfIHCHer2Testing_Histopathology']. \
+            fillna(biomarkers['ResultOfIHCHer2Testing_CoreBiopsy']). \
+            fillna(biomarkers['ResultOfIHCHer2Testing_FNA']).fillna(biomarkers['ResultOfIHCHer2Testing_Other'])
+
+        biomarkers['her2_result_fish'] = biomarkers['ResultOfFishHer2Testing_Histopathology']. \
+            fillna(biomarkers['ResultOfFishHer2Testing_CoreBiopsy']). \
+            fillna(biomarkers['ResultOfFishHer2Testing_FNA']).fillna(biomarkers['ResultOfFishHer2Testing_Other'])
+
+        biomarkers['her2_result'] = biomarkers.apply(her2_result, axis=1)
+
+        biomarkers['her2_copies'] = biomarkers['NumberOfCopiesOfHer2_Histopathology']. \
+            fillna(biomarkers['NumberOfCopiesOfHer2_CoreBiopsy']). \
+            fillna(biomarkers['NumberOfCopiesOfHer2_FNA']).fillna(biomarkers['NumberOfCopiesOfHer2_Other'])
+
+        biomarkers['ki67_result'] = biomarkers['Ki67Result_Histopathology']. \
+            fillna(biomarkers['Ki67Result_CoreBiopsy']). \
+            fillna(biomarkers['Ki67Result_FNA']).fillna(biomarkers['Ki67Tested_Other'])
+
+        biomarkers['oncotypedx_result'] = biomarkers['OncotypeDx_Histopathology']. \
+            fillna(biomarkers['OncotypeDx_CoreBiopsy']). \
+            fillna(biomarkers['OncotypeDx_FNA']).fillna(biomarkers['OncotypeDx_Other'])
+
+        biomarkers = biomarkers[cols]
+
+        biomarkers.to_pickle(Path('datasets/bcfnz/pickle/processed/biomarkers.pickle'))
+    return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/biomarkers.pickle'))
+
+
+def process_lesions():
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/lesions.pickle')):
+        cols = ['patient_no', 'workup_no', 'bilateral_synchronous',
+                'invasive_tumour_size', 'combined_tumour_size',
+                'histological_grade', 'er_status_histopathology', 'pr_status_histopathology']
+
+        lesions = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/lesions.pickle'))
+
+        lesions.rename(columns={"PatientNo": "patient_no",
+                                "WorkupNo": "workup_no"}, inplace=True)
+
+        lesions['bilateral_synchronous'] = lesions['BilateralSynchronousBreastCancer'].apply(
+            lambda x:
+            1 if x == 'Yes'
+            else 0 if x == 'No'
+            else 9
+        )
+        lesions['invasive_tumour_size'] = lesions['InvasiveTumourSize']
+        lesions['combined_tumour_size'] = lesions['CombinedTumourSize']
+        lesions['histological_grade'] = lesions['HistologicalInvasiveCancerGrade'].apply(
+            lambda x:
+            9 if x == 'Unknown / not assessable'
+            else x
+        )
+
+        lesions['er_status_histopathology'] = lesions['HP Oestrogen Result'].apply(
+            lambda x:
+            1 if x == 'Positive'
+            else 0 if x == 'Negative'
+            else 9
+        )
+
+        lesions['pr_status_histopathology'] = lesions['HP Progesterone result'].apply(
+            lambda x:
+            1 if x == 'Positive'
+            else 0 if x == 'Negative'
+            else 9
+        )
+
+        lesions = lesions[cols]
+
+        lesions.to_pickle(Path('datasets/bcfnz/pickle/processed/lesions.pickle'))
+    return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/lesions.pickle'))
+
+
+def process_mets():
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/metastatic_disease.pickle')):
+        cols = ['patient_no', 'workup_no', 'metstime']
+
+        mets = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/metastatic_disease.pickle'))
+
+        mets.rename(columns={"PatientNo": "patient_no",
+                             "WorkupNo": "workup_no"}, inplace=True)
+
+        mets['metstime'] = (mets['DateOfMetastaticDisease'] - mets['DateOfTissueDiagnosis']).dt.days
+
+        mets = mets[cols]
+
+        mets.to_pickle(Path('datasets/bcfnz/pickle/processed/metastatic_disease.pickle'))
+    return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/metastatic_disease.pickle'))
+
+
+def load_diagnosis_bcfnz():
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/diagnosis.pickle')):
+        demographics = process_demographics()
+        workup = process_workup()
+        biomarkers = process_biomarkers()
+        lesions = process_lesions()
+        mets = process_mets()
+
+        diagnosis = demographics.merge(workup, on=['patient_no', 'workup_no'], how='outer')
+        diagnosis = diagnosis.merge(biomarkers, on=['patient_no', 'workup_no'], how='outer')
+        diagnosis = diagnosis.merge(lesions, on=['patient_no', 'workup_no'], how='outer')
+        diagnosis = diagnosis.merge(mets, on=['patient_no', 'workup_no'], how='outer')
+
+        diagnosis.to_pickle('datasets/bcfnz/pickle/processed/diagnosis.pickle')
+
+    return pd.read_pickle('datasets/bcfnz/pickle/processed/diagnosis.pickle')
 
 
 def load_bcfnz():
@@ -85,138 +558,45 @@ def load_bcfnz():
 
     """
 
-    demographics = pd.read_excel(Path('datasets/bcfnz/Demographic Data_DeIdentified.xlsx'))
+    tables = ("demographics", "workup", "followup", "histopathology",
+              "lesions", "biomarkers", "metastatic_disease", "surgery_primary",
+              "therapy_biological", "therapy_chemo", "therapy_hormone", "therapy_radio"
+              )
 
-    demographics['brca'] = demographics.apply(brca_result, axis=1).astype("category")
-    # print(demographics["brca"].value_counts())
-    # 43009 = unknown or not tested
-    # 1647 = tested & negative
-    # 459 = tested & positive
+    for table in tables:
+        if not os.path.isfile(f"datasets/bcfnz/pickle/unprocessed/{table}.pickle"):
+            df = pd.read_excel(Path(f'datasets/bcfnz/excel/{table}.xlsx'))
+            df.to_pickle(f"datasets/bcfnz/pickle/unprocessed/{table}.pickle")
 
-    demographics['diagnosis_year'] = demographics['DateOfTissueDiagnosis'].dt.year
-    demographics['surv'] = demographics["Current Patient Status"].apply(
-        lambda x:
-        1 if x == 'Alive' else
-        0 if x == "Dead"
-        else 9)
+    diagnosis = load_diagnosis_bcfnz()
 
-    demographics['survtime'] = (demographics['Date Of Death'] - demographics['DateOfTissueDiagnosis']).dt.days
-    demographics['death_cause'] = demographics['Cause Of Death'].apply(
-        lambda x:
-        1 if x == 'Breast cancer' else
-        2 if x == 'Other' else
-        9 if x == 'Unknown' else
-        None
-    )
-    demographics['death_cause_verified'] = demographics['Cause Of Death Verified By MOH'].apply(
-        lambda x:
-        1 if x == 'Yes' else
-        0 if x == 'No' else
-        None
-    )
-    demographics['death_icd_code'] = demographics['ICDCodeOfTheCauseOfDeath'].str.lower()
+    print(diagnosis.describe(include="all"))
+    print(diagnosis.info(verbose=True))
 
-    # drop unnecessary columns
-    demographics = demographics.drop(columns=['DateOfTissueDiagnosis', "Date Of Death",
-                                              'Genetic test result (BRCA1)',
-                                              'Genetic test result (BRCA2)',
-                                              'Current Patient Status',
-                                              'Cause Of Death',
-                                              'Cause Of Death Verified By MOH',
-                                              'ICDCodeOfTheCauseOfDeath'])
+    followup = load_followup_bcfnz()
+    print(followup.describe(include="all"))
 
-    demographics.rename(columns={"Ethnicity (Level 1)": "ethnicity",
-                                 "Gender": "gender",
-                                 "Region": "region",
-                                 "Age At Diagnosis": "diagnosis_age"}, inplace=True)
-
-    print(demographics[['death_cause']].value_counts())
-    print(demographics[['death_cause_verified']].value_counts())
-    print(demographics[['death_icd_code']].value_counts())
-
-    test = demographics[demographics['death_cause_verified'] == 0]
-    print(test['death_cause'].value_counts())
-
-    print(demographics.head().to_markdown())
-    print(demographics.columns)
-    del demographics
-
-    workup = pd.read_excel(Path('datasets/bcfnz/Workup_DeIdentified.xlsx'))
-    """
-    DiagnosisType
-    Invasive & in situ    19161
-    Invasive              17329
-    In situ                 494
-    Unknown                  66
-    """
-    workup['invasive'] = workup['DiagnosisType'].apply(lambda x:
-                                                       1 if x == 'Invasive & in situ' or x == 'Invasive'
-                                                       else 0)
-
-    workup['primary_surgery'] = workup['PrimarySurgery'].apply(lambda x:
-                                                               1 if x == 'Yes'
-                                                               else 0 if x == 'No'
-                                                               else 9)
-
-    workup['symptomatic'] = workup['DidThePatientPresentWithSymptomsAtTimeOfReferral'].apply(lambda x:
-                                                                                             1 if x == 'Yes'
-                                                                                             else 0 if x == 'No'
-                                                                                             else 9)
-    print(workup['symptomatic', 'DidThePatientPresentWithSymptomsAtTimeOfReferral'].value_counts())
-
-    workup['referral_source'] = workup['SourceOfReferral'].apply(
-        lambda x:
-        0 if x == 'BreastScreen Aotearoa' or x == 'Screen detected - non BSA'
-        else 1 if x == 'GP (symptomatic)'
-        else 9 if x == 'Unknown'
-        else 3
-    )
-
-    print(workup['SourceOfReferral'].value_counts())
-    print(workup['referral_source'].value_counts())
-
-    workup['neoadj_radiation'] = workup['PrimaryOrNeoAdjuvantRadiationTherapy'].apply(
-        lambda x:
-        0 if x == 'Not referred - deemed not necessary' or x == 'Referred - deemed not necessary'
-        else 1 if x == 'Yes'
-        else 2 if x == 'Referred - patient unfit' or x == 'Not referred - patient unfit'
-        else 3 if x == 'Referred - patient declined' or x == 'Not referred - patient declined'
-        else 99 if x == 'n/a - treatment for metastatic disease'
-        else 9
-    )
-
-    print(workup['neoadj_radiation'].value_counts())
-
-    print(workup['invasive'].value_counts())
-
-    print(workup['MetastaticDisease'].value_counts())
-    print(workup['primary_surgery'].value_counts())
-
-    workup = workup.drop(columns=['PrimarySurgery',
-                                  "DidThePatientPresentWithSymptomsAtTimeOfReferral",
-                                  'DiagnosisType'])
-
-    print(workup.head().to_markdown())
-
-    del workup
-
-    biomarkers = pd.read_excel(Path('datasets/bcfnz/Biomarkers_DeIdentified.xlsx'))
-    print(biomarkers.head().to_markdown())
-    print(biomarkers.columns)
-    del biomarkers
-
-    lesions = pd.read_excel(Path('datasets/bcfnz/Lesions_DeIdentified.xlsx'))
-    print(lesions.head().to_markdown())
-    print(lesions.columns)
-    del lesions
-
-    # allow mets cases if they are diagnosed with mets > 1 mo ? after their primary surgery
-    mets = pd.read_excel(Path('datasets/bcfnz/MetastaticDisease_DeIdentified.xlsx'))
-    followup = Path('datasets/bcfnz/Followup_DeIdentified.xlsx')
+    treatments = load_treatments_bcfnz()
 
     result = pd.DataFrame()
 
     return result
+
+
+def workup_therapy_map(x):
+    if x == 'Not referred - deemed not necessary' or x == 'Referred - deemed not necessary':
+        val = 0
+    elif x == 'Yes':
+        val = 1
+    elif x == 'Referred - patient unfit' or x == 'Not referred - patient unfit':
+        val = 2
+    elif x == 'Referred - patient declined' or x == 'Not referred - patient declined':
+        val = 3
+    elif x == 'n/a - treatment for metastatic disease':
+        val = 99
+    else:
+        val = 9
+    return val
 
 
 def load_bcfnz_filter_cohort():
