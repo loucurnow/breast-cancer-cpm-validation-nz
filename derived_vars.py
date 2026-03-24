@@ -38,6 +38,16 @@ def brca_result(row):
     return result
 
 
+def her2_priority_agg(series):
+    # Convert to set for fast lookup
+    vals = set(series)
+    if 1 in vals: return 1
+    if 2 in vals: return 2
+    if 0 in vals: return 0
+    if 9 in vals: return 9
+    return None # Or a default value
+
+
 def her2_result(row):
     """
     0 = negative
@@ -59,7 +69,8 @@ def her2_result(row):
             or (ihc == 'IHC HER2 2+' and fish == 'FISH HER2 Amplified (positive)') \
             or (ihc == 'IHC HER2 2+' and fish == 'FISH HER2 (equivocal)') \
             or (ihc == 'IHC HER2 1+' and fish == 'FISH HER2 Amplified (positive)')\
-            or (pd.isna(ihc) and fish == 'FISH HER2 Amplified (positive)'):
+            or (pd.isna(ihc) and fish == 'FISH HER2 Amplified (positive)') \
+            or (ihc == 'IHC HER2 0' and fish == 'FISH HER2 Amplified (positive)'):
         return 1
 
     # equivocal if:
@@ -74,7 +85,9 @@ def her2_result(row):
     # ihc her2 0 and fish negative
     if (ihc == 'IHC HER2 1+' and fish == 'FISH HER2 No Amplification (negative)')\
             or (ihc == 'IHC HER2 0' and fish == 'FISH HER2 No Amplification (negative)')\
-            or (pd.isna(ihc) and fish == 'FISH HER2 No Amplification (negative)'):
+            or (pd.isna(ihc) and fish == 'FISH HER2 No Amplification (negative)')\
+            or (ihc == 'IHC HER2 1+' and fish == 'FISH HER2 (equivocal)')\
+            or (ihc == 'IHC HER2 0' and fish == 'FISH HER2 (equivocal)'):
         return 0
 
     if pd.isna(fish):  # when fish her2 result is not known

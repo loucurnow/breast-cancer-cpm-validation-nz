@@ -5,7 +5,7 @@ from tabulate import tabulate
 import numpy as np
 import os
 
-from derived_vars import tumour_size_group_path_stage_groupings, brca_result, her2_result
+from derived_vars import tumour_size_group_path_stage_groupings, brca_result, her2_result, her2_priority_agg
 
 
 def load_followup_bcfnz():
@@ -61,25 +61,21 @@ def load_followup_bcfnz():
 
 
 def load_treatments_bcfnz():
-    treatments = load_workup_treatments()
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/treatments.pickle')):
+        treatments = load_workup_treatments()
 
-    # from surgery, need to extract: did they have surgery?
-    # need to refer to matthew's work here,don't have med knowledge req to understand his filtering
-    surgery = process_surgery()
+        for t in ['hormone', 'biological', 'chemo', 'radio']:
+            therapy_df = pd.read_pickle(Path(f'datasets/bcfnz/pickle/unprocessed/therapy_{t}.pickle'))
+            therapy_df = clean_therapy_df(therapy_df, t)
 
-    for t in ['hormone', 'biological', 'chemo', 'radio']:
-        therapy_df = pd.read_pickle(Path(f'datasets/bcfnz/pickle/unprocessed/therapy_{t}.pickle'))
-        therapy_df = clean_therapy_df(therapy_df, t)
+            treatments = treatments.merge(therapy_df, on=['patient_no', 'workup_no'], how='outer')
 
-        if t == 'radio':
-            print(therapy_df.info(verbose=True))
+        treatments.to_pickle('datasets/bcfnz/pickle/processed/treatments.pickle')
 
-        treatments = treatments.merge(therapy_df, on=['patient_no', 'workup_no'], how='outer')
-
-    return treatments
+    return pd.read_pickle('datasets/bcfnz/pickle/processed/treatments.pickle')
 
 
-def process_surgery():
+def load_surgery():
     if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/surgery.pickle')):
         surgery = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/surgery_primary.pickle'))
 
@@ -140,9 +136,44 @@ def process_surgery():
                              "IgeCode": "ige_code"}, 
                              inplace=True)
 
-        long.to_pickle('datasets/bcfnz/pickle/processed/surgery_primary.pickle')
+        long.dropna(subset=['surgery_type', 'axillary_surgery_type', 'ige_code'], how='all', inplace=True)
 
-    return long
+        long['mastectomy'] = np.where(long['surgery_type'] == 'Mastectomy', 1, 0)
+        long['mastectomy_prophylactic'] = np.where(long['surgery_type'] == 'Prophylactic mastectomy', 1, 0)
+        long['lumpectomy'] = np.where(long['surgery_type'] == 'Lumpectomy / excision biopsy', 1, 0)
+        long['wle'] = np.where(long['surgery_type'] == 'WLE / partial mastectomy', 1, 0)
+        long['hookwire'] = np.where(long['surgery_type'] == 'Hookwire localisation excision', 1, 0)
+        long['reexcision'] = np.where(long['surgery_type'] == 'Re-excision', 1, 0)
+
+        long['sentinel_node_biopsy'] = np.where(long['axillary_surgery_type'] == 'Sentinel node biopsy', 1, 0)
+        long['ax_level_1'] = np.where(long['axillary_surgery_type'] == 'Level 1 (axillary node sample)', 1, 0)
+        long['ax_level_2'] = np.where(long['axillary_surgery_type'] == 'Level 2 (axillary node dissection)', 1, 0)
+        long['ax_level_3'] = np.where(long['axillary_surgery_type'] == 'Level 3 (axillary node clearance)', 1, 0)
+
+        long['diagnosis_to_surgery'] = (long['date_of_primary_surgery'] - long['date_of_tissue_diagnosis']).dt.days
+        long['diagnosis_to_first_surgery'] = long.groupby(['patient_no', 'workup_no', 'breast_side'])['diagnosis_to_surgery'].transform('min')
+
+        # save full surgery information
+        long.drop(columns=['surgery_type',
+                           'axillary_surgery_type'], inplace=True)
+        long.to_pickle('datasets/bcfnz/pickle/processed/surgery_primary_full.pickle')
+
+        # aggregate to one workup per row for model input. show if each surgery type happened, ignore dates
+        long.drop(columns=['date_of_tissue_diagnosis',
+                           'date_of_primary_surgery'], inplace=True)
+        columns_to_max = [
+            'mastectomy', 'mastectomy_prophylactic', 'lumpectomy', 'wle',
+            'hookwire', 'reexcision', 'sentinel_node_biopsy',
+            'ax_level_1', 'ax_level_2', 'ax_level_3', 'diagnosis_to_first_surgery'
+        ]
+        aggregated_df = long.groupby(['patient_no', 'workup_no', 'breast_side'])[columns_to_max].max().reset_index()
+
+        aggregated_df.drop_duplicates(inplace=True)
+
+        aggregated_df.to_pickle('datasets/bcfnz/pickle/processed/surgery.pickle')
+        aggregated_df.to_csv('datasets/bcfnz/excel/surgery_primary_agg.csv')
+
+    return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/surgery.pickle'))
 
 
 def load_workup_treatments():
@@ -201,54 +232,51 @@ def clean_therapy_df(df, therapy_type: str):
 
     rename_map = {
         r'PatientNo': 'patient_no',
-        r'WorkupNo': 'workup_no'
+        r'WorkupNo': 'workup_no',
+        r'StartDateBiologicalTherapy': 'start_date_bio',
+        r'StopDateBiologicalTherapy': 'stop_date_bio',
+        r'TimingOfBiologicalTherapy': 'timing_bio',
+        r'BiologicalTherapy': 'therapy_name_bio',
+        r'StartDateOfChemotherapy': 'start_date_chemo',
+        r'TimingOfChemotherapy': 'timing_chemo',
+        r'TypeOfChemotherapy': 'type_chemo',
+        r'TypeOfChemotherapyRegimen': 'regimen_type_chemo',
+        r'CompletedAsPlannedChemotherapy': 'completed_chemo',
+        r'NumberOfCycles': 'cycles_chemo',
+        r'StartDateOfHormoneTherapy': 'start_date_hormone',
+        r'StopDateHormoneTherapy': 'stop_date_hormone',
+        r'TimingOfHormoneTherapy': 'timing_hormone',
+        r'HormoneTherapy': 'therapy_name_hormone',
+        r'DiscontinuedHormoneTherapy': 'discontinued_hormone'
     }
 
+    df = df.rename(columns=rename_map)
+
+    df['DateOfTissueDiagnosis'] = pd.to_datetime(df['DateOfTissueDiagnosis'], errors='coerce')
+
     if therapy_type == 'biological':
-        rename_map.update({
-            r'StartDateBiologicalTherapy': 'start_date',
-            r'StopDateBiologicalTherapy': 'stop_date',
-            r'TimingOfBiologicalTherapy': 'timing',
-            r'BiologicalTherapy': 'therapy_name'
-        })
+        df['bio_in'] = 1
+        df['start_date_bio'] = pd.to_datetime(df['start_date_bio'], errors='coerce')
+        df['diagnosis_to_treatment_bio'] = (df['start_date_bio'] - df['DateOfTissueDiagnosis']).dt.days
 
     elif therapy_type == 'hormone':
-        rename_map.update({
-            r'StartDateOfHormoneTherapy': 'start_date',
-            r'StopDateHormoneTherapy': 'stop_date',
-            r'TimingOfHormoneTherapy': 'timing',
-            r'HormoneTherapy': 'therapy_name',
-            r'DiscontinuedHormoneTherapy': 'discontinued_hormone'
-        })
+        df["hormone_in"] = 1
+        df['start_date_hormone'] = pd.to_datetime(df['start_date_hormone'], errors='coerce')
+        df['diagnosis_to_treatment_hormone'] = (df['start_date_hormone'] - df['DateOfTissueDiagnosis']).dt.days
 
     elif therapy_type == 'chemo':
-        rename_map.update({
-            r'StartDateOfChemotherapy': 'start_date',
-            r'TimingOfChemotherapy': 'timing',
-            r'TypeOfChemotherapy': 'chemo_type',
-            r'TypeOfChemotherapyRegimen': 'chemo_regimen_type',
-            r'CompletedAsPlannedChemotherapy': 'chemo_completed',
-            r'NumberOfCycles': 'chemo_cycles'
-        })
+        df["chemo_in"] = 1
+        df['start_date_chemo'] = pd.to_datetime(df['start_date_chemo'], errors='coerce')
+        df['diagnosis_to_treatment_chemo'] = (df['start_date_chemo'] - df['DateOfTissueDiagnosis']).dt.days
 
     elif therapy_type == 'radio':
         df.columns = (
             df.columns
-                .str.replace(r"Timing Of Radiation Therapy.*", "timing", regex=True)
-                .str.replace(r"Total Dose.*", "total_dose", regex=True)
-                .str.replace(r"Radiation Type.*", "radiation_type", regex=True)
+                .str.replace(r"Timing Of Radiation Therapy.*", "timing_radio", regex=True)
+                .str.replace(r"Total Dose.*", "total_dose_radio", regex=True)
+                .str.replace(r"Radiation Type.*", "type_radio", regex=True)
         )
-
-    df = df.rename(columns=rename_map)
-
-    # add column for time from diagnosis to therapy
-    if 'start_date' in df.columns:
-        df['start_date'] = pd.to_datetime(df['start_date'], errors='coerce')
-        df['DateOfTissueDiagnosis'] = pd.to_datetime(df['DateOfTissueDiagnosis'], errors='coerce')
-
-        # time from diagnosis until trt
-        df['diagnosis_to_treatment_time'] = (df['start_date'] - df['DateOfTissueDiagnosis']).dt.days
-
+        df["radio_in"] = 1
 
     # drop the region and dateoftissuediagnosis columns
     df = df.drop(columns=["DateOfTissueDiagnosis", "Region"])
@@ -413,6 +441,7 @@ def process_biomarkers():
         biomarkers.rename(columns={"PatientNo": "patient_no",
                                    "WorkupNo": "workup_no"}, inplace=True)
 
+        # her2 result chosen based off histopathology if available, then core biopsy, then FNA, then other
         biomarkers['her2_result_ihc'] = biomarkers['ResultOfIHCHer2Testing_Histopathology']. \
             fillna(biomarkers['ResultOfIHCHer2Testing_CoreBiopsy']). \
             fillna(biomarkers['ResultOfIHCHer2Testing_FNA']).fillna(biomarkers['ResultOfIHCHer2Testing_Other'])
@@ -421,21 +450,26 @@ def process_biomarkers():
             fillna(biomarkers['ResultOfFishHer2Testing_CoreBiopsy']). \
             fillna(biomarkers['ResultOfFishHer2Testing_FNA']).fillna(biomarkers['ResultOfFishHer2Testing_Other'])
 
-        biomarkers['her2_result'] = biomarkers.apply(her2_result, axis=1)
+        biomarkers['her2_result_per_test'] = biomarkers.apply(her2_result, axis=1)
+        biomarkers['her2_result'] = biomarkers.groupby(['patient_no', 'workup_no'])['her2_result_per_test'].transform(her2_priority_agg)
 
         biomarkers['her2_copies'] = biomarkers['NumberOfCopiesOfHer2_Histopathology']. \
             fillna(biomarkers['NumberOfCopiesOfHer2_CoreBiopsy']). \
             fillna(biomarkers['NumberOfCopiesOfHer2_FNA']).fillna(biomarkers['NumberOfCopiesOfHer2_Other'])
 
-        biomarkers['ki67_result'] = biomarkers['Ki67Result_Histopathology']. \
+        biomarkers['ki67_result_per_test'] = biomarkers['Ki67Result_Histopathology']. \
             fillna(biomarkers['Ki67Result_CoreBiopsy']). \
             fillna(biomarkers['Ki67Result_FNA']).fillna(biomarkers['Ki67Tested_Other'])
+        biomarkers['ki67_result'] = biomarkers.groupby(['patient_no', 'workup_no'])['ki67_result_per_test'].transform('max')
+
 
         biomarkers['oncotypedx_result'] = biomarkers['OncotypeDx_Histopathology']. \
             fillna(biomarkers['OncotypeDx_CoreBiopsy']). \
             fillna(biomarkers['OncotypeDx_FNA']).fillna(biomarkers['OncotypeDx_Other'])
 
         biomarkers = biomarkers[cols]
+        biomarkers = biomarkers.drop_duplicates()
+        biomarkers.to_csv(Path('datasets/bcfnz/excel/biomarkers_partial.csv'))
 
         biomarkers.to_pickle(Path('datasets/bcfnz/pickle/processed/biomarkers.pickle'))
     return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/biomarkers.pickle'))
@@ -481,6 +515,7 @@ def process_lesions():
         )
 
         lesions = lesions[cols]
+        lesions = lesions.drop_duplicates()
 
         lesions.to_pickle(Path('datasets/bcfnz/pickle/processed/lesions.pickle'))
     return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/lesions.pickle'))
@@ -493,13 +528,19 @@ def process_mets():
         mets = pd.read_pickle(Path('datasets/bcfnz/pickle/unprocessed/metastatic_disease.pickle'))
 
         mets.rename(columns={"PatientNo": "patient_no",
-                             "WorkupNo": "workup_no"}, inplace=True)
+                             "WorkupNo": "workup_no",
+                             "DateOfMetastaticDisease": "date_mets",
+                             "DateOfTissueDiagnosis": "date_of_tissue_diagnosis"}, inplace=True)
 
-        mets['metstime'] = (mets['DateOfMetastaticDisease'] - mets['DateOfTissueDiagnosis']).dt.days
+        mets['metstime'] = (mets['date_mets'] - mets['date_of_tissue_diagnosis']).dt.days
 
-        mets = mets[cols]
+        # keep only the first mets record per workup
+        mets_sorted = mets.sort_values(by=['workup_no', 'date_mets'])
+        mets_first = mets_sorted.groupby('workup_no').first().reset_index()
 
-        mets.to_pickle(Path('datasets/bcfnz/pickle/processed/metastatic_disease.pickle'))
+        mets_first = mets_first[cols]
+
+        mets_first.to_pickle(Path('datasets/bcfnz/pickle/processed/metastatic_disease.pickle'))
     return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/metastatic_disease.pickle'))
 
 
@@ -510,11 +551,18 @@ def load_diagnosis_bcfnz():
         biomarkers = process_biomarkers()
         lesions = process_lesions()
         mets = process_mets()
+        followup = load_followup_bcfnz()
 
         diagnosis = demographics.merge(workup, on=['patient_no', 'workup_no'], how='outer')
+        print(diagnosis.shape)
         diagnosis = diagnosis.merge(biomarkers, on=['patient_no', 'workup_no'], how='outer')
+        print(diagnosis.shape)
+
         diagnosis = diagnosis.merge(lesions, on=['patient_no', 'workup_no'], how='outer')
+        print(diagnosis.shape)
         diagnosis = diagnosis.merge(mets, on=['patient_no', 'workup_no'], how='outer')
+        print(diagnosis.shape)
+        diagnosis = diagnosis.merge(followup, on=['patient_no', 'workup_no'], how='outer')
 
         diagnosis.to_pickle('datasets/bcfnz/pickle/processed/diagnosis.pickle')
 
@@ -570,13 +618,22 @@ def load_bcfnz():
 
     diagnosis = load_diagnosis_bcfnz()
 
-    print(diagnosis.describe(include="all"))
     print(diagnosis.info(verbose=True))
 
-    followup = load_followup_bcfnz()
-    print(followup.describe(include="all"))
+    del diagnosis
+
+    # from surgery, need to extract: did they have surgery?
+    # need to refer to matthew's work here,don't have med knowledge req to understand his filtering
+    surgery = load_surgery()
+    print(surgery.info(verbose=True))
+    del surgery
 
     treatments = load_treatments_bcfnz()
+
+    print(treatments.describe(include="all"))
+    print(treatments.info(verbose=True))
+
+    del treatments
 
     result = pd.DataFrame()
 
@@ -613,6 +670,8 @@ def load_bcfnz_filter_cohort():
     # print(df[['gender']].value_counts())
     demographics = df[df['gender'] == 'Female']
 
+    # first diagnosis only
+
     return df
 
 
@@ -625,5 +684,6 @@ def shuffle_and_split_data(data, test_ratio):
 
 
 if __name__ == '__main__':
+    biomarkers = process_biomarkers()
     data = load_bcfnz()
     print(tabulate(data, headers='keys', tablefmt='plain'))
