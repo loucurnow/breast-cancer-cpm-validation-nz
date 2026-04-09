@@ -269,6 +269,50 @@ def clean_therapy_df(df, therapy_type: str):
         df['start_date_chemo'] = pd.to_datetime(df['start_date_chemo'], errors='coerce')
         df['diagnosis_to_treatment_chemo'] = (df['start_date_chemo'] - df['DateOfTissueDiagnosis']).dt.days
 
+        # update the completed_chemo column
+        df['completed_chemo'] = df['completed_chemo'].astype(str).str.lower().str.strip()
+
+        # YES
+        df['completed_chemo_yes'] = df['completed_chemo'].str.contains(r'\byes\b', na=False)
+
+        # NO - DISEASE PROGRESSION
+        df['completed_chemo_no_disease_progression'] = df['completed_chemo'].str.contains('disease progression', na=False)
+
+        # NO - PATIENT REQUEST
+        df['completed_chemo_no_patient_request'] = df['completed_chemo'].str.contains('patient’s request|patient request', na=False)
+
+        # NO - TOXICITY (Includes Hospitalisation OR Stopped for Toxicity OR the paclitaxel/peripheral neuropathy note)
+        df['completed_chemo_no_toxicity'] = df['completed_chemo'].str.contains(
+            'toxicity|hospitalisation|neuropathy|peripheral|toxicity|reaction', na=False
+        )
+
+        # NO - PATIENT DEATH
+        df['completed_chemo_no_patient_death'] = df['completed_chemo'].str.contains('died|death|deceased', na=False)
+
+        # DOSE ADJUSTED
+        df['completed_chemo_dose_adjusted'] = df['completed_chemo'].str.contains('dose adjusted', na=False)
+
+        # 3. Create an 'OTHER' flag for the ones that don't fit any of the above (like the abscess note)
+        # This finds rows that aren't NaN/None but didn't trigger any of our specific flags
+        known_columns = [
+            'completed_chemo_yes', 'completed_chemo_no_disease_progression',
+            'completed_chemo_no_patient_request', 'completed_chemo_no_toxicity',
+            'completed_chemo_no_patient_death', 'completed_chemo_dose_adjusted'
+        ]
+
+        # If none of the flags are True AND the original value wasn't 'nan'
+        df['completed_chemo_other'] = (~df[known_columns].any(axis=1)) & (df['completed_chemo'] != 'nan')
+
+        # 4. Optional: Convert True/False to 1/0 for cleaner pivoting later
+        df[known_columns + ['completed_chemo_other']] = df[known_columns + ['completed_chemo_other']].astype(int)
+
+        # drop the original completed_chemo column
+        df = df.drop(columns=["completed_chemo"])
+
+        df = add_chemo_generations(df)
+        # drop the original column now
+        df = df.drop(columns=['type_chemo'])
+
     elif therapy_type == 'radio':
         df.columns = (
             df.columns
@@ -280,6 +324,37 @@ def clean_therapy_df(df, therapy_type: str):
 
     # drop the region and dateoftissuediagnosis columns
     df = df.drop(columns=["DateOfTissueDiagnosis", "Region"])
+
+    return df
+
+
+def add_chemo_generations(df):
+    df = df.copy()
+
+    # 1. Standardize the column to lowercase for robust matching
+    df['type_chemo'] = df['type_chemo'].astype(str).str.lower()
+
+    # 2. Define the Generation Mappings using Regex
+    # Generation 1: CMF variants
+    gen1_pattern = 'cmf|cyclophosphamide \(cp\) - oral'
+
+    # Generation 2: Anthracyclines (A/E drugs)
+    gen2_pattern = 'ac and/or ec|doxorubicin|epirubicin|fac|fec|^fe$|pld|lipsomal'
+
+    # Generation 3: Taxanes & Platinums (T/C drugs)
+    gen3_pattern = 'docetaxel|paclitaxel|carboplatin|nabpaclitaxel|^at$|tc|tch'
+
+    # Other/Salvage:
+    gen_other_pattern = 'capecitabine|gemcitabine|vinorelbine|eribulin|other'
+
+    # 3. Create the flags
+    df['type_chemo_gen_1'] = df['type_chemo'].str.contains(gen1_pattern, na=False).astype(int)
+    df['type_chemo_gen_2'] = df['type_chemo'].str.contains(gen2_pattern, na=False).astype(int)
+    df['type_chemo_gen_3'] = df['type_chemo'].str.contains(gen3_pattern, na=False).astype(int)
+    df['type_chemo_gen_other'] = df['type_chemo'].str.contains(gen_other_pattern, na=False).astype(int)
+
+    # 4. Handle 'Unknown' specifically
+    df['type_chemo_unknown'] = df['type_chemo'].str.contains('unknown', na=False).astype(int)
 
     return df
 
@@ -544,6 +619,41 @@ def process_mets():
     return pd.read_pickle(Path('datasets/bcfnz/pickle/processed/metastatic_disease.pickle'))
 
 
+def treatments_one_row_per_workup():
+    df = load_treatments_bcfnz()
+
+    # 1. Identify Categorical Columns
+    standard_cat_cols = [
+        'timing_hormone', 'therapy_name_hormone', 'discontinued_hormone',
+        'timing_bio', 'therapy_name_bio', 'timing_chemo',
+        'regimen_type_chemo', 'timing_radio', 'type_radio'
+    ]
+
+    # 2. Process Standard Categorical Columns
+    df_standard_bins = pd.get_dummies(df[standard_cat_cols], prefix=standard_cat_cols)
+
+
+    # 4. Identify Numeric Columns
+    min_cols = [col for col in df.columns if 'diagnosis_to_treatment' in col]
+    max_cols = [col for col in df.columns if any(x in col for x in ['neoadj_', 'adj_', '_in', 'ovarian_ablation', 'completed_chemo',
+                                                                    'type_chemo'])]
+
+    # 5. Combine and Defragment
+    df_processed = pd.concat([
+        df[['workup_no'] + min_cols + max_cols],
+        df_standard_bins,
+    ], axis=1).copy()  # .copy() fixes the PerformanceWarning fragmentaton
+
+    # 6. Construct Aggregation Dictionary
+    # All binary columns (standard and multi-val) + max_cols get 'max'
+    binary_cols = df_standard_bins.columns.tolist()
+    agg_dict = {col: 'max' for col in binary_cols + max_cols}
+    agg_dict.update({col: 'min' for col in min_cols})
+
+    # 7. Group and aggregate
+    summary_df = df_processed.groupby('workup_no', sort=False).agg(agg_dict).reset_index()
+    return summary_df
+
 def load_diagnosis_bcfnz():
     if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/diagnosis.pickle')):
         demographics = process_demographics()
@@ -606,38 +716,40 @@ def load_bcfnz():
 
     """
 
-    tables = ("demographics", "workup", "followup", "histopathology",
-              "lesions", "biomarkers", "metastatic_disease", "surgery_primary",
-              "therapy_biological", "therapy_chemo", "therapy_hormone", "therapy_radio"
-              )
+    if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/combined_one_row_per_workup.pickle')):
 
-    for table in tables:
-        if not os.path.isfile(f"datasets/bcfnz/pickle/unprocessed/{table}.pickle"):
-            df = pd.read_excel(Path(f'datasets/bcfnz/excel/{table}.xlsx'))
-            df.to_pickle(f"datasets/bcfnz/pickle/unprocessed/{table}.pickle")
+        tables = ("demographics", "workup", "followup", "histopathology",
+                  "lesions", "biomarkers", "metastatic_disease", "surgery_primary",
+                  "therapy_biological", "therapy_chemo", "therapy_hormone", "therapy_radio"
+                  )
 
-    diagnosis = load_diagnosis_bcfnz()
+        for table in tables:
+            if not os.path.isfile(f"datasets/bcfnz/pickle/unprocessed/{table}.pickle"):
+                df = pd.read_excel(Path(f'datasets/bcfnz/excel/{table}.xlsx'))
+                df.to_pickle(f"datasets/bcfnz/pickle/unprocessed/{table}.pickle")
 
-    print(diagnosis.info(verbose=True))
+        diagnosis = load_diagnosis_bcfnz()
+        # from surgery, need to extract: did they have surgery?
+        # need to refer to matthew's work here,don't have med knowledge req to understand his filtering
+        surgery = load_surgery()
+        treatments = treatments_one_row_per_workup()
 
-    del diagnosis
 
-    # from surgery, need to extract: did they have surgery?
-    # need to refer to matthew's work here,don't have med knowledge req to understand his filtering
-    surgery = load_surgery()
-    print(surgery.info(verbose=True))
-    del surgery
+        final_df = diagnosis.merge(surgery, on='workup_no', how='left')
+        final_df = final_df.merge(treatments, on='workup_no', how='left')
 
-    treatments = load_treatments_bcfnz()
+        del diagnosis
+        del surgery
+        del treatments
 
-    print(treatments.describe(include="all"))
-    print(treatments.info(verbose=True))
+        print(final_df.describe(include="all"))
+        #print(final_df.info(verbose=True))
 
-    del treatments
+        final_df.to_pickle('datasets/bcfnz/pickle/processed/combined_one_row_per_workup.pickle')
+    else:
+        final_df = pd.read_pickle('datasets/bcfnz/pickle/processed/combined_one_row_per_workup.pickle')
 
-    result = pd.DataFrame()
-
-    return result
+    return final_df
 
 
 def workup_therapy_map(x):
@@ -684,6 +796,6 @@ def shuffle_and_split_data(data, test_ratio):
 
 
 if __name__ == '__main__':
-    biomarkers = process_biomarkers()
     data = load_bcfnz()
+    print(data.columns)
     print(tabulate(data, headers='keys', tablefmt='plain'))
