@@ -11,7 +11,7 @@ from pathlib import Path
 import argparse
 import pandas as pd
 import numpy as np
-
+from scripts.align_dataframes import fix_excel_1900_leap_bug
 
 def load_py(path: Path) -> pd.DataFrame:
     return pd.read_pickle(path)
@@ -22,10 +22,11 @@ def load_r(path: Path) -> pd.DataFrame:
 
     rr = pyreadr.read_r(str(path))
     _, df = next(iter(rr.items()))
+    df = fix_excel_1900_leap_bug(df)
     return df
 
 
-def compare(df_py: pd.DataFrame, df_r: pd.DataFrame, keys=("WorkupNo", "tissue_dx_date")):
+def compare(df_py: pd.DataFrame, df_r: pd.DataFrame, keys=("PatientNo", "WorkupNo", "tissue_dx_date")):
     # pick available keys
     avail_keys = [k for k in keys if k in df_py.columns and k in df_r.columns]
     if not avail_keys:
@@ -49,6 +50,14 @@ def compare(df_py: pd.DataFrame, df_r: pd.DataFrame, keys=("WorkupNo", "tissue_d
     common_cols = [c for c in left.columns if c in right.columns]
     only_py = sorted([c for c in left.columns if c not in right.columns])
     only_r = sorted([c for c in right.columns if c not in left.columns])
+
+    print(f"Comparing {len(left)} rows and {len(common_cols)} common columns..."
+          f" (only in py: {len(only_py)}, only in R: {len(only_r)})")
+    
+    if only_py:
+        print("Columns only in Python output:", only_py)
+    if only_r:
+        print("Columns only in R output:", only_r)
 
     summary = {
         "rows_compared": len(left),
@@ -79,11 +88,38 @@ def compare(df_py: pd.DataFrame, df_r: pd.DataFrame, keys=("WorkupNo", "tissue_d
     summary["diff_columns_count"] = len(diffs)
     summary["diff_columns_sample_counts"] = diffs
 
-    # prepare example mismatches for export
+    # prepare example mismatches for export and include index/key values
     mismatch_rows = []
     for c in diffs:
-        mask = (left[c].fillna("").astype(str).str.strip() != right[c].fillna("").astype(str).str.strip())
-        ex = pd.DataFrame({f"{c}_py": left.loc[mask, c].astype(object), f"{c}_r": right.loc[mask, c].astype(object)})
+        a = left[c]
+        b = right[c]
+        # compute inequality mask using same dtype-aware logic as above
+        if pd.api.types.is_datetime64_any_dtype(a) or pd.api.types.is_datetime64_any_dtype(b):
+            a2 = pd.to_datetime(a, errors="coerce")
+            b2 = pd.to_datetime(b, errors="coerce")
+            neq = a2.fillna(pd.NaT) != b2.fillna(pd.NaT)
+        elif pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b):
+            neq = ~(a.fillna(np.nan).astype(float).eq(b.fillna(np.nan).astype(float)))
+        else:
+            neq = a.fillna("").astype(str).str.strip() != b.fillna("").astype(str).str.strip()
+
+        mask = neq
+
+        sel_left = left.loc[mask, c]
+        sel_right = right.loc[mask, c]
+
+        idx = sel_left.index
+        # build a DataFrame of index/key values
+        names = list(idx.names) if hasattr(idx, "names") else [idx.name]
+        if len(names) > 1:
+            col_names = [n if n else f"index_{i}" for i, n in enumerate(names)]
+            idx_df = pd.DataFrame(list(idx), columns=col_names)
+        else:
+            name = names[0] or "index"
+            idx_df = pd.DataFrame({name: list(idx)})
+
+        ex_vals = pd.DataFrame({f"{c}_py": sel_left.astype(object).values, f"{c}_r": sel_right.astype(object).values})
+        ex = pd.concat([idx_df.reset_index(drop=True), ex_vals.reset_index(drop=True)], axis=1)
         # keep at most 5 rows per column
         mismatch_rows.append(ex.head(5))
 
@@ -121,3 +157,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    #df = load_r(Path("/home/lou/coding/bcf/breast-cancer-cpm-validation-nz/datasets/bcfnz/strother/tidy_biological_markers.Rda"))
+    #print(df[df['PatientNo'] == 12737.0].to_markdown())

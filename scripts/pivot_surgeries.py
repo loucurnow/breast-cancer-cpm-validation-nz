@@ -46,22 +46,8 @@ def pivot_surgeries(
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-    # split comma/semicolon-separated surgery-type strings into separate rows
-    # so multiple procedures recorded in one cell become separate surgery records
-    for col in (left_col, right_col):
-        if col and col in df.columns:
-            # Only split/explode when the column is an axillary-surgery field
-            # (these sometimes come as comma/semicolon-separated lists).
-            if 'axillary' not in col.lower():
-                continue
-            # ensure column is object-dtype so we can assign lists into it
-            df[col] = df[col].where(df[col].notna(), None).astype(object)
-            mask = df[col].notna()
-            if mask.any():
-                df.loc[mask, col] = df.loc[mask, col].astype(str).str.split(r"\s*[,;]\s*")
-                df = df.explode(col)
-
     # sort and number surgeries per workupno
+    # should be be numbered by distinct surgery date
     df = df.sort_values(id_cols + [date_col])
     df["surg_n"] = df.groupby(id_cols).cumcount() + 1
 
@@ -83,7 +69,26 @@ def pivot_surgeries(
     if not parts:
         raise RuntimeError("No pivot produced; check column names and input file")
 
-    out = pd.concat(parts, axis=1)
+    df = pd.concat(parts, axis=1)
+
+    # split comma/semicolon-separated surgery-type strings into separate rows
+    # so multiple procedures recorded in one cell become separate surgery records
+    for col in (left_col, right_col):
+        if col and col in df.columns:
+            # Only split/explode when the column is a surgery type field
+            # (these sometimes come as comma/semicolon-separated lists).
+            if 'type' not in col.lower():
+                continue
+            # ensure column is object-dtype so we can assign lists into it
+            df[col] = df[col].where(df[col].notna(), None).astype(object)
+            mask = df[col].notna()
+            if mask.any():
+                df.loc[mask, col] = df.loc[mask, col].astype(str).str.split(r"\s*[,;]\s*")
+                df = df.explode(col)
+
+    out = df
+
+
     # also pivot surgery dates into L_surg_date_N / R_surg_date_N columns
     try:
         date_pivot = df.pivot_table(index=id_cols, columns="surg_n", values=date_col, aggfunc="first")
@@ -116,15 +121,38 @@ def pivot_surgeries(
     return out
 
 
-def surg_first_last(df: pd.DataFrame, id_col: list = ["WorkupNo", "tissue_dx_date"], date_col: str = "DateOfSurgery") -> pd.DataFrame:
+def surg_dates_by_side(df: pd.DataFrame, id_col: list = ["PatientNo", "WorkupNo", "tissue_dx_date"], date_col: str = "DateOfSurgery") -> pd.DataFrame:
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    surg_dates = df.groupby(id_col)[date_col].agg(first_surg_date="min", last_surg_date="max").reset_index()
+    df['surg_n'] = df.groupby(id_col).cumcount() + 1
+
+    df_dates = df.groupby(id_col)[date_col].agg(first_surg_date="min", last_surg_date="max").reset_index()
     # convert to dates (no time) to keep output compact
-    surg_dates["first_surg_date"] = pd.to_datetime(surg_dates["first_surg_date"], errors="coerce").dt.date
-    surg_dates["last_surg_date"] = pd.to_datetime(surg_dates["last_surg_date"], errors="coerce").dt.date
-    out = df.merge(surg_dates, on=id_col, how="left")
-    return surg_dates
+    df_dates["first_surg_date"] = pd.to_datetime(df_dates["first_surg_date"], errors="coerce").dt.date
+    df_dates["last_surg_date"] = pd.to_datetime(df_dates["last_surg_date"], errors="coerce").dt.date
+    df = df.merge(df_dates, how="left", on=id_col)
+
+
+    left_df = df[~df["left_surgeries"].isna() & (df["left_surgeries"] != "")]
+    # pivot surgery dates into columns like L_surg_date_1, L_surg_date_2... or R_surg_date_1, R_surg_date_2...
+    left_date_pivot = left_df.pivot_table(index=id_col, columns="surg_n", values="DateOfSurgery", aggfunc="first")
+    left_date_pivot.columns = [f"L_surg_date_{int(c)}" for c in left_date_pivot.columns]
+
+    right_df = df[~df["right_surgeries"].isna() & (df["right_surgeries"] != "")]
+    # pivot surgery dates into columns like L_surg_date_1, L_surg_date_2... or R_surg_date_1, R_surg_date_2...
+    right_date_pivot = right_df.pivot_table(index=id_col, columns="surg_n", values="DateOfSurgery", aggfunc="first")
+    right_date_pivot.columns = [f"R_surg_date_{int(c)}" for c in right_date_pivot.columns]
+
+    date_pivot = left_date_pivot.merge(right_date_pivot, how='outer', on=id_col)
+
+    # for date columns, convert nulls to 1900-01-01 to avoid NaT issues in downstream merges/comparisons, then convert back to dates
+    date_pivot = date_pivot.fillna(pd.Timestamp("1900-01-01"))   # should be a plain date not a timestamp, but just in case convert back to date after filling nulls
+    
+    for col in date_pivot.columns:
+        if "_surg_date_" in col:
+            date_pivot[col] = date_pivot[col].dt.date
+
+    return date_pivot.reset_index()
 
 
 def prepare_surgery_data(
@@ -142,6 +170,20 @@ def prepare_surgery_data(
     one-hot columns named like `L_1_<sanitized_type>` / `R_1_<sanitized_type>`.
     Returns the prepared DataFrame.
     """
+
+    # get one row per unique date for surgery type cols
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    
+    result = df.groupby(id_cols + [date_col]).agg({
+        left_col: lambda x: ', '.join(x.dropna().unique()),
+        right_col: lambda x: ', '.join(x.dropna().unique())
+    }).reset_index()
+
+    df = df.drop(columns=[right_col, left_col])
+    df = df.drop_duplicates()
+    
+    df = df.merge(result, on=id_cols + [date_col], how='left')
     
     out = pivot_surgeries(df, id_cols=id_cols, date_col=date_col, left_col=left_col, right_col=right_col)
 
@@ -187,8 +229,6 @@ def prepare_surgery_data(
             s = 'decline_surg'
         elif s == 'sentinel_node_biopsy':
             s = 'snb'
-        elif s == 'sampling':
-            s = 'L1_ax_ln_samp'
         elif s == 'mastectomy':
             s = 'mastectomy'
         elif s == 're_excision':
@@ -219,6 +259,7 @@ def prepare_surgery_data(
         return out
 
     melted["type_sanit"] = melted["surg_type"].apply(sanitize)
+
     melted = melted.dropna(subset=["surg_type"]) 
     melted["newcol"] = melted["surg_col"].astype(str) + "_" + melted["type_sanit"]
     dummies = pd.get_dummies(melted["newcol"]) 
@@ -229,6 +270,7 @@ def prepare_surgery_data(
     if drop_original:
         out = out.drop(columns=value_cols, errors="ignore")
     return out
+
 
 
 def main():
