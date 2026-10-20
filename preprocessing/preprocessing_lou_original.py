@@ -11,6 +11,11 @@ sys.path.append(str(project_root))
 from preprocessing.derived_vars import tumour_size_group_path_stage_groupings, brca_result, her2_result, her2_priority_agg
 
 
+"""
+This code is not required as part of the main data pipeline. 
+This was work originally done without the reference to Matthew Strother's R code, and includes significant differences in logic.
+"""
+
 def load_followup_bcfnz():
     if not os.path.isfile(Path('datasets/bcfnz/pickle/processed/followup.pickle')):
         cols = ['patient_no', 'workup_no', 'followup_lrr', 'followup_mets', 'followup_surv',
