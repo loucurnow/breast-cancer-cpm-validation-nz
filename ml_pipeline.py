@@ -1,11 +1,11 @@
 """
 Run the ML pipeline
 """
-import preprocessing
+import preprocessing.preprocessing_lou_original as preprocessing_lou_original
 
 
 if __name__ == '__main__':
-    housing = preprocessing.load_gbcr_data()
+    housing = preprocessing_lou_original.load_gbcr_data()
 
     housing.info()
 

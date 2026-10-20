@@ -7,7 +7,7 @@ import pyreadr
 import matplotlib.pyplot as plt
 from tabulate import tabulate
 
-from preprocessing import load_gbcscs
+from preprocessing.preprocessing_lou_original import load_gbcscs
 
 
 # function to create a table where key characteristics are summarised

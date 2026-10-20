@@ -1,11 +1,14 @@
 from pathlib import Path
 import pandas as pd
-import matplotlib.pyplot as plt
+import sys
 from tabulate import tabulate
 import numpy as np
 import os
 
-from derived_vars import tumour_size_group_path_stage_groupings, brca_result, her2_result, her2_priority_agg
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
+
+from preprocessing.derived_vars import tumour_size_group_path_stage_groupings, brca_result, her2_result, her2_priority_agg
 
 
 def load_followup_bcfnz():

@@ -48,18 +48,18 @@ def compare_tables(df1, df2, key, save_dir=None):
     else:
         common_cols_no_key = common_cols
 
-    df1 = df1[common_cols_no_key].sort_index()
-    df2 = df2[common_cols_no_key].sort_index()
-
-    df1 = df1.reset_index().copy()
-    df2 = df2.reset_index().copy()
+    df1 = df1[common_cols_no_key].sort_index().reset_index().copy()
+    df2 = df2[common_cols_no_key].sort_index().reset_index().copy()
 
     # get data types in df2 to conform to df1 for comparison
     df1, df2 = align_dtypes(df1, df2)
 
     # Merge df1 (39612) and df2 (39314) on PatientNo
     # 'indicator=True' adds a column called '_merge'
+    df1 = df1.copy()
+    df2 = df2.copy()
     merged = pd.merge(df1, df2, on=key, how='outer', indicator=True, suffixes=('_df1', '_df2'))
+    merged = merged.copy()
 
     # Rows present ONLY in df1
     only_in_df1 = merged[merged['_merge'] == 'left_only'].copy()
@@ -98,7 +98,12 @@ def compare_tables(df1, df2, key, save_dir=None):
     # Now compare
     differences = common_df1.compare(common_df2)
 
-    print("Differences in common rows:")
+    if differences.empty:
+        print("No differences found in common rows.")
+    else:
+        print(f"Differences found in {len(differences)} rows of common patients.")
+        print(f"Columns with differences: {differences.columns.get_level_values(0).unique().tolist()}")
+
 
     if save_dir:
         differences.to_csv(save_dir / 'differences.csv', index=True)

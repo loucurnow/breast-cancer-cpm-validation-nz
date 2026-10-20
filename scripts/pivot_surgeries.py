@@ -130,8 +130,6 @@ def surg_dates_by_side(df: pd.DataFrame, id_col: list = ["PatientNo", "WorkupNo"
     # convert to dates (no time) to keep output compact
     df_dates["first_surg_date"] = pd.to_datetime(df_dates["first_surg_date"], errors="coerce").dt.date
     df_dates["last_surg_date"] = pd.to_datetime(df_dates["last_surg_date"], errors="coerce").dt.date
-    df = df.merge(df_dates, how="left", on=id_col)
-
 
     left_df = df[~df["left_surgeries"].isna() & (df["left_surgeries"] != "")]
     # pivot surgery dates into columns like L_surg_date_1, L_surg_date_2... or R_surg_date_1, R_surg_date_2...
@@ -151,6 +149,8 @@ def surg_dates_by_side(df: pd.DataFrame, id_col: list = ["PatientNo", "WorkupNo"
     for col in date_pivot.columns:
         if "_surg_date_" in col:
             date_pivot[col] = date_pivot[col].dt.date
+
+    date_pivot = date_pivot.merge(df_dates, how="left", on=id_col)
 
     return date_pivot.reset_index()
 
@@ -211,6 +211,8 @@ def prepare_surgery_data(
             s = 'ppx_mastectomy'
         elif s == 'wle_partial_mastectomy':
             s = 'wle_partial_matectomy'
+        elif s == 'wle_partial_matectomy':
+            s = 'wle_partial_matectomy'
         elif s == 'unknown':
             s = 'unknown_surg'
         elif s == 'no_breast_surgery':
@@ -269,6 +271,18 @@ def prepare_surgery_data(
     out = out.merge(wide, on=id_cols, how="left")
     if drop_original:
         out = out.drop(columns=value_cols, errors="ignore")
+
+    # create columns of all 0s if they don't exist
+    missing_cols = ['L_4_lumpectomy_ex_biopsy', 'R_4_no_breast_surg', 'L_4_decline_surg', 'R_3_no_breast_surg', 
+                    'L_surg_date_5', 'R_surg_date_5', 'L_surg_date_6', 'R_surg_date_6', 'L_surg_date_7', 'R_surg_date_7', 
+                    'R_4_L3_ax_ln_clear', 'first_surg_date', 'R_4_hookwire_local', 'R_3_unknown_surg', 
+                    'R_4_decline_surg', 'L_4_no_breast_surg', 'L_4_unknown_surg', 'L_4_hookwire_local',
+                     'L_4_L3_ax_ln_clear', 'L_4_wle_partial_matectomy', 'R_3_hookwire_local', 'R_4_unknown_surg', 
+                     'L_3_hookwire_local', 'R_4_wle_partial_matectomy']
+    for col in missing_cols:
+        if col not in out.columns:
+            df[col] = 0
+
     return out
 
 

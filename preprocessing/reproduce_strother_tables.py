@@ -3,17 +3,26 @@ This file contains functions which read in the original Excel files and then
 apply transformations to produce tidy datasets matching the R pipeline used by Strother in their project
 The output files are written as pickles and CSVs to `datasets/bcfnz/pickle/processed/strother` and can be compared to the R .Rda files if available.
 """
-import os
+import sys
 from pathlib import Path
+
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
+
 import pandas as pd
 import numpy as np
 from scripts.pivot_surgeries import prepare_surgery_data, surg_dates_by_side
-import tabulate
-from scripts.compare_dataframes import load_py, load_r, compare
+from scripts.compare_dataframes import load_py, load_r
 from scripts.compare_tables import compare_tables, align_dtypes
+from utils.helpers import check_and_prompt
+from utils.summary_funcs import duplicates_by_unique_id
+from functools import reduce
+from preprocessing.derived_vars import lost_to_followup
+from preprocessing.reproduce_strother_surgical_completeness import add_surgical_completeness
 
 
-def transform_surgery(from_path: Path = Path('datasets/bcfnz/excel/surgery_primary.xlsx'),
+@check_and_prompt
+def transform_surgery_primary(from_path: Path = Path('datasets/bcfnz/excel/surgery_primary.xlsx'),
 					  out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
 	"""Read surgery XLSX from `from_path`, write pickles to `out_dir` and compare to Strother R data if available.
 
@@ -33,7 +42,7 @@ def transform_surgery(from_path: Path = Path('datasets/bcfnz/excel/surgery_prima
 		df_full.drop(columns=['LeftBreastIgeCode', 'RightBreastIgeCode'], inplace=True)
 
 
-		id_columns = ['PatientNo', 'WorkupNo', 'tissue_dx_date']
+		id_columns = ['PatientNo', 'tissue_dx_date']
 
 		# get one row per unique date for surgery type cols
 		df = df_full.copy()
@@ -66,8 +75,6 @@ def transform_surgery(from_path: Path = Path('datasets/bcfnz/excel/surgery_prima
 
 		df_dates = surg_dates_by_side(result, id_col=id_columns, date_col='DateOfSurgery')
 		
-		print(df_dates[df_dates['PatientNo'] == 10128])
-
 		surg = prepare_surgery_data(
 			result,
 			id_cols=id_columns,
@@ -92,6 +99,15 @@ def transform_surgery(from_path: Path = Path('datasets/bcfnz/excel/surgery_prima
 		df_out = surg.merge(df_dates, on=id_columns, how='outer')
 
 		print('df out cols', df_out.columns)
+
+		# missing 'L_4_lumpectomy_ex_biopsy', set all to 999 missing
+		missing_cols = ['L_4_wle_partial_matectomy', 'L_4_L3_ax_ln_clear', 'L_4_lumpectomy_ex_biopsy', 'R_4_wle_partial_matectomy', 'R_4_L3_ax_ln_clear']
+		df_out[missing_cols] = 999
+
+		# unless another L_4_{surg} column has a 1, then set L_4_lumpectomy_ex_biopsy to 0
+		for col in missing_cols:
+			matching_cols = [c for c in df_out.columns if c.startswith(col.rsplit('_', 1)[0] + '_') and c != col]
+			df_out.loc[df_out[matching_cols].eq(1).any(axis=1), col] = 0
 
 		# combine any duplicate one-hot columns produced by primary and axillary merges
 		# (pandas will have created pairs like 'L_1_unknown_surg_x' and 'L_1_unknown_surg_y')
@@ -238,6 +254,7 @@ def transform_surgery(from_path: Path = Path('datasets/bcfnz/excel/surgery_prima
 	return results
 
 
+@check_and_prompt
 def transform_demographics(from_path: Path = Path('datasets/bcfnz/excel/demographic.xlsx'),
 						 workup_path: Path = Path('datasets/bcfnz/excel/workup.xlsx'),
 						 out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
@@ -259,20 +276,28 @@ def transform_demographics(from_path: Path = Path('datasets/bcfnz/excel/demograp
 
 
 	# read files
-	df_demo = pd.read_excel(from_path, index_col=0)
+	df_demo = pd.read_excel(from_path)
 	if workup_path.exists():
-		df_workup = pd.read_excel(workup_path, index_col=0)
+		df_workup = pd.read_excel(workup_path, 
+							na_filter=True, 
+							keep_default_na=False, 
+							na_values=[
+								'', '#N/A', '#N/A N/A', '#NA', 
+								'-1.#IND', '-1.#QNAN', '-NaN', '-nan', 
+								'1.#IND', '1.#QNAN', '<NA>', 'N/A', 'NA', 
+								'NULL', 'NaN', 'n/a', 'nan', 'null'])
 	else:
 		df_workup = pd.DataFrame()
 
-	# drop Region and DateOfTissueDiagnosis from Demographics as in R
-	for c in ('Region', 'DateOfTissueDiagnosis'):
+	# drop Region from Demographics as in R
+	for c in ('Region', 'WorkupNo'):
 		if c in df_demo.columns:
 			df_demo = df_demo.drop(columns=[c])
 
-	# left join on WorkupNo and PatientNo
-	if not df_workup.empty and all(k in df_demo.columns for k in ('WorkupNo', 'PatientNo')) and all(k in df_workup.columns for k in ('WorkupNo', 'PatientNo')):
-		df = df_demo.merge(df_workup, on=['WorkupNo', 'PatientNo'], how='left')
+
+	# left join on PatientNo
+	if not df_workup.empty and all(k in df_demo.columns for k in ('PatientNo', 'DateOfTissueDiagnosis',)) and all(k in df_workup.columns for k in ('PatientNo', 'DateOfTissueDiagnosis',)):
+		df = df_demo.merge(df_workup, on=['PatientNo', 'DateOfTissueDiagnosis'], how='left')
 	else:
 		df = df_demo.copy()
 
@@ -394,40 +419,6 @@ def transform_demographics(from_path: Path = Path('datasets/bcfnz/excel/demograp
 
 	# write outputs
 	out_pickle = out_dir / 'tidy_demographics.pickle'
-
-	# ensure columns present in R tidy_demographics exist in our output
-	try:
-		import pyreadr
-		rfile = Path('datasets/bcfnz/strother/tidy_demographics.Rda')
-		if rfile.exists():
-			rr = pyreadr.read_r(str(rfile))
-			_, df_r = next(iter(rr.items()))
-			miss = [c for c in df_r.columns if c not in df.columns]
-			if miss:
-				# prefer merge keys if available
-				keys = [k for k in ('WorkupNo', 'PatientNo') if k in df.columns and k in df_r.columns]
-				if keys:
-					merge_df = df_r[[*keys, *[c for c in miss if c in df_r.columns]]].drop_duplicates(subset=keys)
-					df = df.merge(merge_df, on=keys, how='left')
-				# any remaining missing columns: create sensible defaults
-				for c in miss:
-					if c not in df.columns:
-						if 'date' in c.lower() or 'tissue_dx' in c.lower():
-							df[c] = pd.NaT
-						elif any(k in c.lower() for k in ('score', 'height', 'weight', 'age', 'charlson')):
-							df[c] = pd.NA
-						else:
-							df[c] = pd.NA
-	except Exception:
-		# fallback: ensure a small set of known columns exist
-		fallback_cols = ['PatientNo', 'Region', 'tissue_dx_date', 'unique_key', 'diagnosis_number']
-		for c in fallback_cols:
-			if c not in df.columns:
-				if 'date' in c:
-					df[c] = pd.NaT
-				else:
-					df[c] = pd.NA
-
 	df.to_pickle(out_pickle)
 	df.to_csv(out_dir / 'tidy_demographics.csv', index=False)
 	results['tidy_demographics'] = str(out_pickle)
@@ -449,6 +440,7 @@ def transform_demographics(from_path: Path = Path('datasets/bcfnz/excel/demograp
 	return results
 
 
+@check_and_prompt
 def transform_biological_markers(from_path: Path = Path('datasets/bcfnz/excel/biomarkers.xlsx'),
 							out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
 	"""Read biomarkers XLSX, pivot testing-source suffixes, tidy repeats and save.
@@ -474,7 +466,7 @@ def transform_biological_markers(from_path: Path = Path('datasets/bcfnz/excel/bi
 
 	# identify columns with underscore suffixes (testing source)
 	cols_with_us = [c for c in df.columns if '_' in c]
-	id_vars = [c for c in ['PatientNo', 'tissue_dx_date', 'WorkupNo'] if c in df.columns]
+	id_vars = [c for c in ['PatientNo', 'tissue_dx_date'] if c in df.columns]
 	print(id_vars)
 
 	if cols_with_us:
@@ -626,9 +618,36 @@ def transform_biological_markers(from_path: Path = Path('datasets/bcfnz/excel/bi
 		biological_markers_tidy['unique_key'] = biological_markers_tidy['PatientNo'].astype(str) + biological_markers_tidy['tissue_dx_date'].dt.strftime('%Y-%m-%d')
 
 	# put workupno back in there because it is a useful identifier and was in the original data (but R code dropped it)
-	if 'WorkupNo' in df.columns:
-		workup = df[['PatientNo','tissue_dx_date','WorkupNo']].drop_duplicates(subset=['PatientNo','tissue_dx_date'])
-		biological_markers_tidy = biological_markers_tidy.merge(workup, on=['PatientNo','tissue_dx_date'], how='left')
+	if 'WorkupNo' in biological_markers_tidy.columns:
+		biological_markers_tidy = biological_markers_tidy.drop(columns=['WorkupNo'])
+
+
+	# do final missing value handling - Strother did this within final merged dataset originally
+	# 1. Fill NA for FISH columns
+	fill_values = {
+		'her2_fish_test_date_1': '1900-01-01', 'her2_fish_1': 'TEST NOT DONE',
+		'her2_fish_test_date_2': '1900-01-01', 'her2_fish_2': 'TEST NOT DONE',
+		'her2_fish_test_date_3': '1900-01-01', 'her2_fish_3': 'TEST NOT DONE',
+		'her2_fish_test_date_4': '1900-01-01', 'her2_fish_4': 'TEST NOT DONE',
+		'her2_fish_test_date_5': '1900-01-01', 'her2_fish_5': 'TEST NOT DONE',
+		'her2_fish_test_date_6': '1900-01-01', 'her2_fish_6': 'TEST NOT DONE'
+	}
+	biological_markers_tidy = biological_markers_tidy.fillna(fill_values)
+
+	# Ensure date columns are actually datetime objects
+	date_cols = [f'her2_fish_test_date_{i}' for i in range(1, 7)]
+	for col in date_cols:
+		biological_markers_tidy[col] = pd.to_datetime(biological_markers_tidy[col])
+
+	# 3. Fill NA for remaining IHC and test dates
+	fill_ihc = {
+		'her2_test_date_1': '1900-01-01', 'her2_ihc_1': 'TEST NOT DONE',
+		'her2_test_date_2': '1900-01-01', 'her2_ihc_2': 'TEST NOT DONE',
+		'her2_test_date_3': '1900-01-01', 'her2_ihc_3': 'TEST NOT DONE',
+		'her2_test_date_4': '1900-01-01', 'her2_ihc_4': 'TEST NOT DONE',
+		'her2_test_date_5': '1900-01-01', 'her2_ihc_5': 'TEST NOT DONE'
+	}
+	biological_markers_tidy = biological_markers_tidy.fillna(fill_ihc)
 
 	# save
 	out_pickle = out_dir / 'tidy_biological_markers.pickle'
@@ -653,6 +672,7 @@ def transform_biological_markers(from_path: Path = Path('datasets/bcfnz/excel/bi
 	return results
 
 
+@check_and_prompt
 def transform_followup(from_path: Path = Path('datasets/bcfnz/excel/followup.xlsx'),
                        out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
 	"""Read followup XLSX, tidy, remove exact duplicates, compute follow-up time and save.
@@ -671,18 +691,7 @@ def transform_followup(from_path: Path = Path('datasets/bcfnz/excel/followup.xls
 		print(f'Path does not exist: {from_path}')
 		return results
 
-	df = pd.read_excel(from_path, index_col=0)
-	# ensure PatientNo is a column (Excel uses PatientNo as index)
-	try:
-		df = df.reset_index()
-	except Exception:
-		pass
-
-	# ensure PatientNo is a column (excel files use PatientNo as index)
-	try:
-		df = df.reset_index()
-	except Exception:
-		pass
+	df = pd.read_excel(from_path)
 
 	# rename columns to canonical names
 	rename_map = {
@@ -744,6 +753,7 @@ def transform_followup(from_path: Path = Path('datasets/bcfnz/excel/followup.xls
 	if 'second_primary_date' in df.columns:
 		df['second_primary_date'] = pd.to_datetime(df['second_primary_date'], errors='coerce').fillna(pd.Timestamp('1900-01-01'))
 
+
 	# save
 	out_pickle = out_dir / 'tidy_fu.pickle'
 	df.to_pickle(out_pickle)
@@ -768,6 +778,7 @@ def transform_followup(from_path: Path = Path('datasets/bcfnz/excel/followup.xls
 	return results
 
 
+@check_and_prompt
 def transform_lesions(from_path: Path = Path('datasets/bcfnz/excel/lesions.xlsx'),
                       out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
 	"""Read lesions XLSX, tidy per Strother R pipeline, and save tidy_lesions.
@@ -918,69 +929,15 @@ def transform_lesions(from_path: Path = Path('datasets/bcfnz/excel/lesions.xlsx'
 	return results
 
 
-def transform_histopathology(from_path: Path = Path('datasets/bcfnz/excel/histopathology.xlsx'),
+@check_and_prompt
+def transform_histopath(from_path: Path = Path('datasets/bcfnz/excel/histopathology.xlsx'),
                       out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
 	"""
-	Histopathology <- read_excel("./data/histopathology.xlsx")
-
-	#rename vectors with difficult naming conventions
-	Histopathology <- Histopathology %>%
-	rename(.,c(
-		tissue_dx_date=`DateOfTissueDiagnosis`,
-		lesion_count= `NumberOfInvasiveLesions`,
-		ax_node_presence = `AxillaryNodesPresent`,
-		node_total_remove = `TotalNumberOfNodesRemoved`,
-		node_involved_count = `NumberOfNodesInvolvedByTumour`,
-		node_largest_deposit = `NodalMetastasisBasedOnTheLargestDeposit`,
-		neoadj_indicator = `NeoAdjuvantIndicatorCode`,
-		neoadj_effect = `NeoAdjuvantTreatmentEffect`,
-		residual_cancer = `ResidualCancerBurden`,
-		neoadj_node_effect = `NeoAdjuvantTreatmentEffectInLymphNodes`,
-		T_primary = `PathologicalTStageBasedOnPrimaryTumour`,
-		N_primary = `PathologicalNStage`,
-		TNM_overall= `OverallTNMStage`
-		))
-
-	histo<-Histopathology |>
-	group_by(PatientNo,tissue_dx_date) |>
-	mutate(dup=row_number()) |>
-	mutate(duplicates=max(dup))
-
-	#this identifies 1300 duplicates - only 2 (no more) but no real patterns - all identifiers and dates the same - histopath key different, and the numbers different - so will spread out and rejoin 
-	#histo_dup<- histo |>
-	#  filter (duplicates==2)
-
-	histo_1 <- histo |>
-	filter(dup == 1)
-
-	histo_2 <- histo |>
-	filter(dup == 2)|>
-	select(PatientNo,tissue_dx_date,lesion_count,ax_node_presence,node_total_remove, node_involved_count,node_largest_deposit, neoadj_indicator, neoadj_effect, residual_cancer, neoadj_node_effect, T_primary, N_primary, TNM_overall)|>
-	rename_with(~ paste0("second_", .), lesion_count:TNM_overall)
-
-	tidy_histopath <- histo_1 |>
-	left_join(histo_2, by=join_by(PatientNo, tissue_dx_date)) |>
-	select(-dup)|>
-	mutate(duplicate_histopath = if_else(duplicates == "2", "YES", "NO"))|>
-	select(-duplicates)
-
-	tidy_histopath<-tidy_histopath |>
-	mutate(node_total_remove = na_if(node_total_remove, 999)) |>
-	mutate(node_involved_count=case_when(
-		node_total_remove == 0 ~ 999,
-		node_total_remove != 0 ~ node_involved_count,
-		is.na(node_total_remove) ~ NA,
-		TRUE ~ 9999999
-	))
-
-	tidy_histopath <- tidy_histopath |>
-	select(!c(WorkupNo, Region))
-	#for all tables - make PatientNo and tissue_dx_date, character and POSIXct consistently 
-	tidy_histopath<-tidy_histopath |>
-	mutate(unique_key=paste0(PatientNo,tissue_dx_date))
-
-	save(tidy_histopath, file="./data/processed/tidy_histopath.Rda")
+	Read histopathology XLSX, tidy per Strother R pipeline, and save tidy_histopath.
 	"""
+
+	results = {}
+
 	df = pd.read_excel(from_path)
 
 	rename_map = {
@@ -1041,333 +998,96 @@ def transform_histopathology(from_path: Path = Path('datasets/bcfnz/excel/histop
 	out_dir.mkdir(parents=True, exist_ok=True)
 	tidy_histopath.to_pickle(out_dir / 'tidy_histopath.pickle')
 
-	return tidy_histopath
+	results['tidy_histopath'] = str(out_dir / 'tidy_histopath.pickle')
+
+	return results
 
 
-def transform_hormone(from_path: Path = Path('datasets/bcfnz/excel/therapy_hormone.xlsx'),
-                      out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
-	"""
-	Hormone_Therapy <- read_excel("./data/therapy_hormone.xlsx")
-
-#rename vectors with difficult naming conventions
-Hormone_Therapy <- Hormone_Therapy %>%
-   rename(.,c(
-     tissue_dx_date=`DateOfTissueDiagnosis`,
-     hormone_setting = `TimingOfHormoneTherapy`,
-     hormone_drug = `HormoneTherapy`,
-     hormone_start_date= `StartDateOfHormoneTherapy`,
-     hormone_stop_date = `StopDateHormoneTherapy`,
-     hormone_discontinued = `DiscontinuedHormoneTherapy`
-              ))
-
-
-#pull neo-adj, adj, and met separately 
-Hormone_Therapy_Neoadj <-Hormone_Therapy |>
-  filter(hormone_setting %in% c("Neo-adjuvant"))|>
-  group_by(PatientNo,tissue_dx_date) |>
-  arrange(tissue_dx_date, .by_group = TRUE)|>
-  mutate(hormone_line_by_tissue_dx=row_number()) |>
-  mutate(lines_neoadj_hormone =max(hormone_line_by_tissue_dx))
-
-neo_hormone_line_1 <- Hormone_Therapy_Neoadj |>
-  filter(hormone_line_by_tissue_dx == 1) |>
-  rename_with(~ paste0("1st_neo_", .), hormone_setting:hormone_stop_date)
-
-neo_hormone_line_2 <- Hormone_Therapy_Neoadj |>
-  filter(hormone_line_by_tissue_dx == 2) |>
-  select(!c(Region, hormone_line_by_tissue_dx, lines_neoadj_hormone, WorkupNo))|>
-  rename_with(~ paste0("2nd_neo_", .), hormone_setting:hormone_stop_date)
-neo_hormone_line_3 <- Hormone_Therapy_Neoadj |>
-  filter(hormone_line_by_tissue_dx == 3) |>
-  select(!c(Region, hormone_line_by_tissue_dx, lines_neoadj_hormone, WorkupNo))|>
-  rename_with(~ paste0("3rd_neo_", .), hormone_setting:hormone_stop_date)
-neo_hormone_line_4 <- Hormone_Therapy_Neoadj |>
-  filter(hormone_line_by_tissue_dx == 4) |>
-  select(!c(Region, hormone_line_by_tissue_dx, lines_neoadj_hormone, WorkupNo))|>
-  rename_with(~ paste0("4th_neo_", .), hormone_setting:hormone_stop_date)
-neo_hormone_line_5 <- Hormone_Therapy_Neoadj |>
-  filter(hormone_line_by_tissue_dx == 5) |>
-  select(!c(Region, hormone_line_by_tissue_dx, lines_neoadj_hormone, WorkupNo))|>
-  rename_with(~ paste0("5th_neo_", .), hormone_setting:hormone_stop_date)
-neo_hormone_line_6 <- Hormone_Therapy_Neoadj |>
-  filter(hormone_line_by_tissue_dx == 6) |>
-  select(!c(Region, hormone_line_by_tissue_dx, lines_neoadj_hormone, WorkupNo))|>
-  rename_with(~ paste0("6th_neo_", .), hormone_setting:hormone_stop_date)
-
-tidy_neoadj <- neo_hormone_line_1 |>
-  left_join(neo_hormone_line_2, join_by(PatientNo,tissue_dx_date))|>
-  left_join(neo_hormone_line_3, join_by(PatientNo,tissue_dx_date))|>
-  left_join(neo_hormone_line_4, join_by(PatientNo,tissue_dx_date))|>
-  left_join(neo_hormone_line_5, join_by(PatientNo,tissue_dx_date))|>
-  left_join(neo_hormone_line_6, join_by(PatientNo,tissue_dx_date))|>
-  mutate(neo_adjuvant_given="YES")
-
-Hormone_Therapy_Adjuvant <- Hormone_Therapy |>
-  filter(hormone_setting %in% c("Adjuvant"))|>
-  group_by(PatientNo,tissue_dx_date) |>
-  arrange(tissue_dx_date, .by_group = TRUE)|>
-  mutate(hormone_line_by_tissue_dx=row_number()) |>
-  mutate(lines_adj_hormone =max(hormone_line_by_tissue_dx))
-
-hormone_line_1 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 1) |>
-  rename_with(~ paste0("1st_adj_", .), hormone_setting:hormone_stop_date)
-
-hormone_line_2 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 2) |>
-  select(PatientNo,tissue_dx_date,hormone_setting,hormone_drug,hormone_start_date,hormone_discontinued,hormone_stop_date)|>
-  rename_with(~ paste0("2nd_adj_", .), hormone_setting:hormone_stop_date)
-
-hormone_line_3 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 3) |>
-  select(PatientNo,tissue_dx_date,hormone_setting,hormone_drug,hormone_start_date,hormone_discontinued,hormone_stop_date)|>
-  rename_with(~ paste0("3rd_adj_", .), hormone_setting:hormone_stop_date)
-
-hormone_line_4 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 4) |>
-  select(PatientNo,tissue_dx_date,hormone_setting,hormone_drug,hormone_start_date,hormone_discontinued,hormone_stop_date)|>
-  rename_with(~ paste0("4rth_adj_", .), hormone_setting:hormone_stop_date)
-
-hormone_line_5 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 5) |>
-  select(PatientNo,tissue_dx_date,hormone_setting,hormone_drug,hormone_start_date,hormone_discontinued,hormone_stop_date) |>
-  rename_with(~ paste0("5th_adj_", .), hormone_setting:hormone_stop_date)
-
-hormone_line_6 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 6) |>
-  select(PatientNo,tissue_dx_date,hormone_setting,hormone_drug,hormone_start_date,hormone_discontinued,hormone_stop_date)|>
-  rename_with(~ paste0("6th_adj_", .), hormone_setting:hormone_stop_date)
-
-hormone_line_7 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 7) |>
-  select(PatientNo,tissue_dx_date,hormone_setting,hormone_drug,hormone_start_date,hormone_discontinued,hormone_stop_date,)|>
-  rename_with(~ paste0("7th_adj_", .), hormone_setting:hormone_stop_date)
-
-hormone_line_8 <- Hormone_Therapy_Adjuvant |>
-  filter(hormone_line_by_tissue_dx == 8) |>
-  select(PatientNo,tissue_dx_date,hormone_setting,hormone_drug,hormone_start_date,hormone_discontinued,hormone_stop_date)|>
-  rename_with(~ paste0("8th_adj_", .), hormone_setting:hormone_stop_date)
-
-tidy_adj_hormone <- hormone_line_1 |>
-  left_join(hormone_line_2, by=join_by(PatientNo,tissue_dx_date)) |>
-  left_join(hormone_line_3, by=join_by(PatientNo,tissue_dx_date)) |>
-  left_join(hormone_line_4, by=join_by(PatientNo,tissue_dx_date)) |>
-  left_join(hormone_line_5, by=join_by(PatientNo,tissue_dx_date)) |>
-  left_join(hormone_line_6, by=join_by(PatientNo,tissue_dx_date)) |>
-  left_join(hormone_line_7, by=join_by(PatientNo,tissue_dx_date)) |>
-  left_join(hormone_line_8, by=join_by(PatientNo,tissue_dx_date)) 
-
-tidy_hormone <- tidy_neoadj |>
-  select(!c(WorkupNo,Region))|>
-  full_join(tidy_adj_hormone, join_by(PatientNo,tissue_dx_date))
-  
-#for all tables - make PatientNo and tissue_dx_date, character and POSIXct consistently 
-tidy_hormone<-tidy_hormone |>
-  mutate(unique_key=paste0(PatientNo,tissue_dx_date))
-
-save(tidy_hormone, file="./data/processed/tidy_hormone.Rda")
-"""
-	pass
-
-
+@check_and_prompt
 def transform_chemo(from_path: Path = Path('datasets/bcfnz/excel/therapy_chemo.xlsx'),
                       out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
 	"""
-	Chemotherapy <- read_excel("./data/therapy_chemo.xlsx")
-
-#rename vectors with difficult naming conventions
-Chemotherapy <- Chemotherapy %>%
-   rename(.,c(
-     tissue_dx_date=`DateOfTissueDiagnosis`,
-     chemo_setting = `TimingOfChemotherapy`,
-     chemo_start_date = `StartDateOfChemotherapy`,
-     chemo_total_cycles = `NumberOfCycles`,
-     chemo_type = `TypeOfChemotherapy`,
-     chemo_completed = `CompletedAsPlannedChemotherapy`,
-     regimen=`TypeOfChemotherapyRegimen`
-              ))
-
-#before separating - order the string for regimen
-Chemotherapy<-Chemotherapy|>
-  mutate(regimen_ordered=map_chr(strsplit(regimen,","), ~
-                                   toString(sort(as.numeric((.x))))))
-
-#neo_adj_chemo <- Chemotherapy |>
-#  filter(chemo_setting == "Neo-adjuvant")|>
-#  group_by(PatientNo,tissue_dx_date)|>
-#  arrange(chemo_start_date, .by_group = TRUE)|>
-#  mutate(neo_adj_line=row_number())
-
-#mostly only 1 line
-
-#neo_adj_chemo_line1 <- neo_adj_chemo |>
-#  filter(neo_adj_line == "1")|>
-#  rename(neo_chemo_regimen_1=regimen_ordered)
-
-#neo_adj_chemo_line2 <- neo_adj_chemo |>
-#  filter(neo_adj_line == "2")|>
-#  select(PatientNo,tissue_dx_date,chemo_start_date,chemo_total_cycles,chemo_type, #chemo_completed_1, chemo_completed_2,regimen_ordered)|>
-#  rename(neo_chemo_start_date_2=chemo_start_date)|>
-#  rename(neo_chemo_total_cycles_2=chemo_total_cycles)|>
-#  rename(neo_chemo_type_2=chemo_type)|>
-#  rename(neo_chemo_completed_1_2=chemo_completed_1)|>
-#  rename(neo_chemo_completed_2_2=chemo_completed_2)|>
-#  rename(neo_chemo_regimen_2=regimen_ordered)
-
-#tidy_neoadj_chemo<-neo_adj_chemo_line1 |>
-#  left_join(neo_adj_chemo_line2, join_by(PatientNo,tissue_dx_date))|>
-#  select(!(neo_adj_line))|>
-#  mutate(neo_adjuvant_received = "YES")
-
-
-adj_chemo <- Chemotherapy |>
-  filter(chemo_setting == "Adjuvant")|>
-  group_by(PatientNo,tissue_dx_date)|>
-  arrange(chemo_start_date, .by_group = TRUE)|>
-  mutate(adj_chemo_line=row_number())
-
-adj_chemo_line1 <- adj_chemo |>
-  filter(adj_chemo_line == "1")|>
-  rename(adj_chemo_regimen_1=regimen_ordered)
-
-adj_chemo_line2 <- adj_chemo |>
-  filter(adj_chemo_line == "2")|>
-  select(PatientNo,tissue_dx_date,chemo_start_date,chemo_total_cycles,chemo_type, chemo_completed,regimen_ordered)|>
-  rename(chemo_start_date_2=chemo_start_date)|>
-  rename(chemo_total_cycles_2=chemo_total_cycles)|>
-  rename(chemo_type_2=chemo_type)|>
-  rename(chemo_completed_2=chemo_completed)|>
-  rename(chemo_regimen_2=regimen_ordered)
-
-tidy_adj_chemo<-adj_chemo_line1 |>
-  left_join(adj_chemo_line2, join_by(PatientNo,tissue_dx_date))|>
-  select(!(adj_chemo_line))
-
-tidy_adj_chemo <- tidy_adj_chemo |>
-  select(!c(WorkupNo,Region,chemo_setting, regimen))|>
-  mutate(chemo_total_cycles = case_when(is.na(chemo_total_cycles) ~ 999, TRUE ~ chemo_total_cycles)) |>
-  mutate(chemo_start_date_2 = case_when(is.na(chemo_start_date_2) ~ as_date("1900 01 01"), 
-         TRUE ~ chemo_start_date_2)) |>
-  mutate(chemo_total_cycles_2 = case_when(
-    chemo_start_date_2 != as_date("1900 01 01") ~ chemo_total_cycles_2,
-    chemo_start_date_2 == as_date("1900 01 01") ~ 999,
-    TRUE ~ 9999))|>
-  mutate(chemo_type_2 = case_when(
-    chemo_start_date_2 != as_date("1900 01 01") ~ chemo_type_2,
-    chemo_start_date_2 == as_date("1900 01 01") ~ "NO CHEMO GIVEN",
-    TRUE ~ "9999"))|>
-  mutate(chemo_completed_2 = case_when(
-    chemo_start_date_2 != as_date("1900 01 01") ~ chemo_completed_2,
-    chemo_start_date_2 == as_date("1900 01 01") ~ "NO CHEMO GIVEN",
-    TRUE ~ "9999"))|>
-  mutate(chemo_regimen_2 = case_when(
-    chemo_start_date_2 != as_date("1900 01 01") ~ chemo_regimen_2,
-    chemo_start_date_2 == as_date("1900 01 01") ~ "NO CHEMO GIVEN",
-    TRUE ~ "9999"))
-               
-#for all tables - make PatientNo and tissue_dx_date, character and POSIXct consistently 
-tidy_chemo <- tidy_adj_chemo |>
-  mutate(unique_key=paste0(PatientNo,tissue_dx_date))
-
-save(tidy_chemo, file="./data/processed/tidy_chemo.Rda")
-"""
-	pass
-
-
-def transform_biological_therapy(from_path: Path = Path('datasets/bcfnz/excel/therapy_biological.xlsx'),
-                      out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
+	Read chemo XLSX, tidy per Strother R pipeline, and save tidy_chemo.
 	"""
-		
-	Biological_Therapy <- read_excel("./data/therapy_biological.xlsx")
+	results = {}
 
-	#rename vectors with difficult naming conventions
-	Biological_Therapy <- Biological_Therapy %>%
-	rename(.,c(
-		tissue_dx_date=`DateOfTissueDiagnosis`,
-		biological_setting = `TimingOfBiologicalTherapy`,
-		biological_therapy = `BiologicalTherapy`,
-		bio_start_date = `StartDateBiologicalTherapy`,
-		bio_stop_date = `StopDateBiologicalTherapy`
-				))
+	chemo = pd.read_excel(from_path)
 
-	#convert to factors as required
-	Biological_Therapy <- Biological_Therapy %>%
-	mutate(across(c(
-		PatientNo,
-		WorkupNo, 
-		Region,
-		biological_setting,
-		biological_therapy), as.factor))
+	# 2. Rename columns
+	rename_map = {
+		'DateOfTissueDiagnosis': 'tissue_dx_date',
+		'TimingOfChemotherapy': 'chemo_setting',
+		'StartDateOfChemotherapy': 'chemo_start_date',
+		'NumberOfCycles': 'chemo_total_cycles',
+		'TypeOfChemotherapy': 'chemo_type',
+		'CompletedAsPlannedChemotherapy': 'chemo_completed',
+		'TypeOfChemotherapyRegimen': 'regimen'
+	}
+	chemo = chemo.rename(columns=rename_map)
 
-	#look to see if a "Adjuvant" event is ever preceeded by a "Neo_Adjuvant" event.  
-	neo_adj_biological <- Biological_Therapy |>
-	group_by(PatientNo,tissue_dx_date) |>
-	arrange(bio_start_date, .by_group = TRUE)|>
-	filter(biological_setting=="Neo-adjuvant")|>
-	mutate(neo_adj_line=row_number())
+	chemo['tissue_dx_date'] = pd.to_datetime(chemo['tissue_dx_date'], errors='coerce')
+	chemo['chemo_start_date'] = pd.to_datetime(chemo['chemo_start_date'], errors='coerce')
 
-	neo_adj_bio_1 <- neo_adj_biological |>
-	filter(neo_adj_line == "1")|>
-	rename(neo_biological_drug_1=biological_therapy)|>
-	rename(neo_bio_start_date_1=bio_start_date)|>
-	rename(neo_bio_stop_date_1=bio_stop_date)|>
-	select(!(neo_adj_line))
+	# 4. Process Adjuvant Chemo
+	adj_chemo = chemo[chemo['chemo_setting'] == "Adjuvant"].copy()
 
-	neo_adj_bio_2 <- neo_adj_biological |>
-	filter(neo_adj_line == "2")|>
-	select(PatientNo,tissue_dx_date,biological_therapy,bio_start_date,bio_stop_date)|>
-	rename(neo_biological_drug_2=biological_therapy)|>
-	rename(neo_bio_start_date_2=bio_start_date)|>
-	rename(neo_bio_stop_date_2=bio_stop_date)
+	print(adj_chemo.dtypes)
 
-	tidy_neoadj_bio<-neo_adj_bio_1 |>
-	left_join(neo_adj_bio_2, join_by(PatientNo,tissue_dx_date))|>
-	mutate(neo_adjuvant_bio_received = "YES")  
-	
-	adj_biological <- Biological_Therapy |>
-	group_by(PatientNo,tissue_dx_date) |>
-	arrange(bio_start_date, .by_group = TRUE)|>
-	filter(biological_setting=="Adjuvant")|>
-	mutate(adj_line=row_number())
+	# Add line number per group
+	# ordering done before NA replacement
+	adj_chemo = adj_chemo.sort_values(['PatientNo', 'tissue_dx_date', 'chemo_start_date'])
+	adj_chemo['adj_chemo_line'] = adj_chemo.groupby(['PatientNo', 'tissue_dx_date']).cumcount() + 1
 
-	adj_bio_1 <- adj_biological |>
-	filter(adj_line == "1")|>
-	rename(adj_biological_drug_1=biological_therapy)|>
-	rename(adj_bio_start_date_1=bio_start_date)|>
-	rename(adj_bio_stop_date_1=bio_stop_date)|>
-	select(!(adj_line))
+	adj_chemo['chemo_total_cycles'] = adj_chemo['chemo_total_cycles'].fillna(999)
+	adj_chemo['chemo_start_date'] = adj_chemo['chemo_start_date'].fillna(pd.Timestamp("1900-01-01"))
 
-	adj_bio_2 <- adj_biological |>
-	filter(adj_line == "2")|>
-	select(PatientNo,tissue_dx_date,biological_therapy,bio_start_date,bio_stop_date)|>
-	rename(adj_biological_drug_2=biological_therapy)|>
-	rename(adj_bio_start_date_2=bio_start_date)|>
-	rename(adj_bio_stop_date_2=bio_stop_date)
+	is_no_chemo = adj_chemo['chemo_start_date'] == pd.Timestamp("1900-01-01")
+	adj_chemo['chemo_total_cycles'] = np.where(is_no_chemo, 999, adj_chemo['chemo_total_cycles'])
+	adj_chemo['chemo_type'] = np.where(is_no_chemo, "NO CHEMO GIVEN", adj_chemo['chemo_type'])
+	adj_chemo['chemo_completed'] = np.where(is_no_chemo, "NO CHEMO GIVEN", adj_chemo['chemo_completed'])
+	adj_chemo['regimen'] = np.where(is_no_chemo, "NO CHEMO GIVEN", adj_chemo['regimen'])
 
-	adj_bio_3 <- adj_biological |>
-	filter(adj_line == "3")|>
-	select(PatientNo,tissue_dx_date,biological_therapy,bio_start_date,bio_stop_date)|>
-	rename(adj_biological_drug_3=biological_therapy)|>
-	rename(adj_bio_start_date_3=bio_start_date)|>
-	rename(adj_bio_stop_date_3=bio_stop_date)
+	# Split into lines
+	line1 = adj_chemo[adj_chemo['adj_chemo_line'] == 1].rename(columns={'regimen': 'adj_chemo_regimen_1'})
+	line2 = adj_chemo[adj_chemo['adj_chemo_line'] == 2][
+		['PatientNo', 'tissue_dx_date', 'chemo_start_date', 'chemo_total_cycles', 
+		'chemo_type', 'chemo_completed', 'regimen']
+	].rename(columns={
+		'chemo_start_date': 'chemo_start_date_2',
+		'chemo_total_cycles': 'chemo_total_cycles_2',
+		'chemo_type': 'chemo_type_2',
+		'chemo_completed': 'chemo_completed_2',
+		'regimen': 'adj_chemo_regimen_2'
+	})
 
-	tidy_adj_bio<-adj_bio_1 |>
-	left_join(adj_bio_2, join_by(PatientNo,tissue_dx_date))|>
-	left_join(adj_bio_3, join_by(PatientNo,tissue_dx_date))
+	# Join
+	tidy_adj_chemo = line1.merge(line2, on=['PatientNo', 'tissue_dx_date'], how='left')
 
-	tidy_bio<-tidy_neoadj_bio |>
-	full_join(tidy_adj_bio, join_by(PatientNo, tissue_dx_date))
+	# 5. Clean up columns and mutate (case_when equivalents)
+	tidy_adj_chemo = tidy_adj_chemo.drop(columns=['WorkupNo', 'Region', 'chemo_setting', 'adj_chemo_line'])
 
-	#for all tables - make PatientNo and tissue_dx_date, character and POSIXct consistently 
-	tidy_bio <-tidy_bio |>
-	mutate(unique_key=paste0(PatientNo,tissue_dx_date))
+	# NA replacement for 2nd chemo cols
+	tidy_adj_chemo['chemo_start_date_2'] = tidy_adj_chemo['chemo_start_date_2'].fillna(pd.Timestamp("1900-01-01"))
+	is_no_chemo = tidy_adj_chemo['chemo_start_date_2'] == pd.Timestamp("1900-01-01")
+	tidy_adj_chemo['chemo_total_cycles_2'] = np.where(is_no_chemo, 999, tidy_adj_chemo['chemo_total_cycles_2'])
+	tidy_adj_chemo['chemo_type_2'] = np.where(is_no_chemo, "NO CHEMO GIVEN", tidy_adj_chemo['chemo_type_2'])
+	tidy_adj_chemo['chemo_completed_2'] = np.where(is_no_chemo, "NO CHEMO GIVEN", tidy_adj_chemo['chemo_completed_2'])
+	tidy_adj_chemo['adj_chemo_regimen_2'] = np.where(is_no_chemo, "NO CHEMO GIVEN", tidy_adj_chemo['adj_chemo_regimen_2'])
+
+	# 6. Final keys and export
+	tidy_adj_chemo['unique_key'] = tidy_adj_chemo['PatientNo'].astype(str) + tidy_adj_chemo['tissue_dx_date'].astype(str)
+
+	out_pickle = out_dir / 'tidy_chemo.pickle'
+	tidy_adj_chemo.to_pickle(out_pickle)
+	tidy_adj_chemo.to_csv(out_dir / 'tidy_chemo.csv', index=False)
+	tidy_adj_chemo['tidy_chemo'] = str(out_pickle)
+
+	results['tidy_chemo'] = str(out_pickle)
+
+	return results
 
 
-	save(tidy_bio, file="./data/processed/tidy_bio.Rda")
-"""
-	pass
-
-
+@check_and_prompt
 def transform_mets(from_path: Path = Path('datasets/bcfnz/excel/metastatic_disease.xlsx'),
                       out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
 	"""
@@ -1542,15 +1262,66 @@ def transform_mets(from_path: Path = Path('datasets/bcfnz/excel/metastatic_disea
 	return results
 
 
+@check_and_prompt
+def generate_strother_files(out_dir: Path = Path('datasets/bcfnz/pickle/processed/strother')) -> dict:
+	"""
+	Generates all raw files as in Matthew Strother's R code
+	"""
+	
+	results = {}
+	id_cols = ['PatientNo', 'tissue_dx_date', 'unique_key']
+
+	transform_surgery_primary()
+	transform_demographics()
+	transform_biological_markers()
+	transform_followup()
+	transform_lesions()
+	transform_histopath()
+	transform_mets()
+	transform_chemo()
+	
+	dfs = []
+	
+	for file_path in out_dir.glob('*.pickle'):
+		if "merged" not in str(file_path):
+			df = pd.read_pickle(file_path)
+
+			# remove WorkupNo if it exists
+			if 'WorkupNo' in df.columns:
+				df = df.drop(columns=['WorkupNo'])
+
+			dfs.append(df)
+
+	combined_df = reduce(lambda left, right: pd.merge(left, right, on=id_cols, how='outer'), dfs)
+
+	# add a lost to followup flag
+	combined_df = lost_to_followup(combined_df)
+
+	# add surgical completeness flags
+	combined_df = add_surgical_completeness(combined_df)
+
+	print(f"Combined dataframe shape: {combined_df.shape}")
+	print(combined_df['PatientNo'].value_counts().head(10))
+
+	out_pickle = out_dir / 'merged_breast_tables.pickle'
+	combined_df.to_pickle(out_pickle)
+	combined_df.to_csv(out_dir / 'merged_breast_tables.csv', index=False)
+
+
+	results['merged_breast_tables'] = str(out_pickle)
+
+	return results
+
+
 
 if __name__ == '__main__':
-	# working: biomarkers (1 diff), mets, demographics, followup, lesions, surgery (4 diffs), histopathology
-	# still to do: hormone, chemo, biological therapy
-	#transform_followup()
-	#transform_lesions()
-	#transform_surgery()
-	#transform_histopathology()
-	tidy_filename = "tidy_histopath"
+	# working: biomarkers (1 diff), mets, demographics, followup, lesions, surgery (4 diffs), histopathology, chemo
+	# still to do: hormone, biological therapy
+	#out = generate_strother_files()
+	#print(out)
+	generate_strother_files()
+
+	tidy_filename = "merged_breast_tables"
 	strother_dir = Path("./datasets/bcfnz/strother/")
 	out_dir = Path("./datasets/bcfnz/pickle/processed/strother/")
 	compare_dir = Path(f"./datasets/bcfnz/compare/{tidy_filename}/")

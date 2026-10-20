@@ -1,0 +1,48 @@
+\begin{landscape}
+\begin{longtable}{p{0.3\textwidth} p{0.35\textwidth} p{0.45\textwidth}}
+\toprule
+Variable & Description & Derivation Rule \\
+\midrule
+\endfirsthead
+\toprule
+Variable & Description & Derivation Rule \\
+\midrule
+\endhead
+\midrule
+\multicolumn{3}{r}{Continued on next page} \\
+\midrule
+\endfoot
+\bottomrule
+\endlastfoot
+\texttt{age.start.in} & Patient age at diagnosis (years) & Direct assignment from Age At Diagnosis \\
+\texttt{screen.in} & Screening detection status & 1 if ReferralSource is 'BreastScreen Aotearoa' or 'Screen detected - non BSA'; 0 if A&E/Emergency/GP symptomatic; 9 otherwise. \\
+\texttt{size.in} & Maximum invasive tumour size (mm) & Max InvasiveTumourSize per case \\
+\texttt{grade.in} & Maximum histological tumour grade & Max HistologicalInvasiveCancerGrade per case \\
+\texttt{nodes.in} & Number of positive lymph nodes & Direct mapping fromNumberOfNodesInvolvedByTumour. \\
+\texttt{er.in} & Oestrogen Receptor status & Mapped from HP Oestrogen Result (Positive = 1, Negative = 0). \\
+\texttt{her2.in} & HER2 receptor status & Combined IHC and FISH priority mapping (1 = positive, 0 = negative, 9 = unknown). \\
+\texttt{ki67.in} & Ki-67 proliferation index status & Assigned 9 (unknown) due to low availability in baseline dataset. \\
+\texttt{pr.in} & Progesterone Receptor status & Mapped from HP Progesterone Result (Positive = 1, Negative = 0). \\
+\texttt{generation.in} & Chemotherapy generation level & Derived from chemo\_type string matching: 3 if anthracycline and taxane present; else 0. \\
+\texttt{horm.in} & Adjuvant hormone therapy indicator & 1 if AdjuvantHormoneTherapy = 'Yes', 0 otherwise \\
+\texttt{traz.in} & Adjuvant Trastuzumab therapy indicator & 1 if any HormoneTherapy = Trastuzumab, 0 otherwise \\
+\texttt{bis.in} & Bisphosphonate therapy indicator & Hardcoded default assignment to 0. \\
+\texttt{radio.in} & Adjuvant radiotherapy indicator & 1 if AdjuvantRadiationTherapy = 'Yes', 0 otherwise \\
+\texttt{heart.gy.in} & Total radiation dose to the heart (Gray) & Sum of Total Dose records where Timing = Adjuvant. \\
+\texttt{smoker.in} & Smoking status indicator & 1 if SmokingStatus = 'Current' or 'Non-smoker exposed to tobacco smoke', 0 otherwise. \\
+\texttt{unique\_key} & Field description pending & Direct extraction from raw data. \\
+\texttt{diag.year} & Year of tissue diagnosis & Extracted year component from DateOfTissueDiagnosis. \\
+\texttt{ethnic} & Patient ethnic group & EthnicityLevel1 from demographic records. Maori, Pacific, Asian, European mapped directly. Remaining ethnicities grouped as 'Other'. \\
+\texttt{menopause} & Menopausal status at diagnosis & Direct extraction from demographic records. \\
+\texttt{Region} & Geographic treatment region & Direct extraction from source record sets. \\
+\texttt{dod} & Date of death & Direct extraction from Demographics data. \\
+\texttt{cod} & Cause of death & Direct extraction from Demographics data. \\
+\texttt{final\_survival\_sweep} & Final follow-up or censoring date & DateOfDeath if exists, otherwise LastFollowupDate. \\
+\texttt{surv.time.actual} & Actual follow-up time (days) & Minimum out of days.to.censor and days.to.death. \\
+\texttt{days.to.censor} & Days from diagnosis to censoring sweep & Difference between final sweep and diagnosis date. \\
+\texttt{days.to.death} & Days from diagnosis to death & Difference between death date and diagnosis date. \\
+\texttt{surv.actual} & Survival status indicator & 0 if DateOfDeath is available, 1 otherwise. \\
+\texttt{treatments.given} & Concatenated systemic and local treatment string & Letter codes appended based on binary indicators for adjuvant hormone, trastuzumab, bisphosphonate, radiotherapy, chemotherapy. \\
+\end{longtable}
+
+\end{landscape}

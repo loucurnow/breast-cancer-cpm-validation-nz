@@ -22,6 +22,7 @@ def load_r(path: Path) -> pd.DataFrame:
 
     rr = pyreadr.read_r(str(path))
     _, df = next(iter(rr.items()))
+
     df = fix_excel_1900_leap_bug(df)
     return df
 
